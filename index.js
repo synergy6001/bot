@@ -771,6 +771,74 @@ const commands = [
       await send(interaction, embed(null, `Test message sent to <#${channel.id}>.`), { ephemeral: true });
     },
   },
+
+  // /rewards
+  {
+    data: new SlashCommandBuilder()
+      .setName('rewards')
+      .setDescription('Post the rewards information embeds in this channel')
+      .setContexts(InteractionContextType.Guild),
+
+    async execute(interaction) {
+      const channel =
+        interaction.channel ?? (await interaction.guild.channels.fetch(interaction.channelId).catch(() => null));
+      if (!channel?.isTextBased()) {
+        await send(interaction, embed(null, "I can't post in this channel."), { ephemeral: true });
+        return;
+      }
+
+      const introduction = embed(
+        'What is this server about?',
+        'FreePass focuses on rewarding its members with various in-game items from Brawl Stars for doing tasks, ' +
+          'such as inviting other members to the server. How do we profit from this? It\'s simple - we have a method ' +
+          'that lets us buy goodies for way cheaper (basically almost free), meaning it\'s a win-win situation since ' +
+          'we get members and potential customers, and our members earn in-game items.',
+      ).setAuthor({ name: 'Introduction' });
+
+      const safety = embed(
+        'How safe is this?',
+        "We purchase items in a legal manner and from a legitimate store, therefore we've never had problems " +
+          'with revokes and such. We do not require logging into your account, just your player tag.',
+      ).setAuthor({ name: 'Safety' });
+
+      const process = embed('How do I get started?')
+        .setAuthor({ name: 'Process' })
+        .addFields(
+          {
+            name: '1. Start inviting people to the server',
+            value:
+              'Get yourself an invite link by clicking on the server name, then "Invite". From there you can copy ' +
+              'the link to send it to others or directly send it to your friends.',
+          },
+          {
+            name: '2. Get enough invites',
+            value:
+              'Check your invites using the "Check Invites" button below, once you have enough for your desired ' +
+              'reward continue to the next step.',
+          },
+          {
+            name: '3. Claim your reward',
+            value:
+              'Head to <#1502298394209550567> and follow the automated process, the item will be sent to you ' +
+              "within 10 minutes and you'll be asked to leave a vouch. Enjoy!",
+          },
+        );
+
+      // channel.send posts a brand new message; it is not a reply to the command.
+      try {
+        await channel.send({
+          embeds: [introduction, safety, process],
+          allowedMentions: NO_MENTIONS,
+        });
+      } catch (err) {
+        await send(interaction, embed(null, `Couldn't post here: ${err.message}`), { ephemeral: true });
+        return;
+      }
+
+      // Slash commands must be acknowledged; keep it private so the channel only shows the embeds.
+      await send(interaction, embed(null, 'Rewards message posted.'), { ephemeral: true });
+    },
+  },
 ];
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c]));
