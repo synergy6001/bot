@@ -38,7 +38,7 @@ if (!DISCORD_TOKEN || !OWNER_ID) {
   process.exit(1);
 }
 
-const COLOR = 0xfbd834; // one consistent embed color
+const COLOR = 0x0056cd; // one consistent embed color
 const NO_MENTIONS = { parse: [] }; // nothing the bot sends can ping anyone
 const DELETED_TTL_MS = 15_000;
 const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
