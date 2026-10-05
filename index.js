@@ -13,6 +13,7 @@ const {
   Client,
   ComponentType,
   EmbedBuilder,
+  escapeMarkdown,
   Events,
   GatewayIntentBits,
   InteractionContextType,
@@ -414,22 +415,32 @@ async function detectInvite(guild) {
   return unknown;
 }
 
-/** The one-line invite announcement. Shared by real joins and /test. */
-function inviteText(inviterId, count) {
-  return `🎉 <@${inviterId}> got a new invite!\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}.`;
+/** A person's display name (server nickname > global display name > username), markdown-escaped. */
+async function nameOf(guild, userId) {
+  const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+  const user = member?.user ?? (await guild.client.users.fetch(userId).catch(() => null));
+  const name = member?.displayName ?? user?.globalName ?? user?.username ?? 'Unknown';
+  return escapeMarkdown(name);
+}
+
+/** The invite announcement. Shared by real joins and /test. Names only, no pings. */
+function inviteText(inviterName, inviteeName, count) {
+  return `${inviterName} invited ${inviteeName} to the server.\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}! ⭐`;
 }
 
 async function sendJoinMessage(member, detected) {
   const channel = await getTrackingChannel(member.guild);
   if (!channel) return;
 
+  const inviteeName = escapeMarkdown(member.displayName);
   let text;
   if (detected.source === 'vanity') {
-    text = `<@${member.id}> joined via the vanity URL.`;
+    text = `${inviteeName} joined via the vanity URL.`;
   } else if (detected.inviterId) {
-    text = inviteText(detected.inviterId, getStats(member.guild.id, detected.inviterId).current);
+    const count = getStats(member.guild.id, detected.inviterId).current;
+    text = inviteText(await nameOf(member.guild, detected.inviterId), inviteeName, count);
   } else {
-    text = `<@${member.id}> joined (inviter unknown).`;
+    text = `${inviteeName} joined (inviter unknown).`;
   }
 
   try {
@@ -747,9 +758,10 @@ const commands = [
       // Preview only: nothing is written to the database. Shows the count as if
       // this were a real invite (current + 1).
       const count = getStats(interaction.guildId, interaction.user.id).current + 1;
+      const name = await nameOf(interaction.guild, interaction.user.id);
       try {
         await channel.send({
-          embeds: [embed(null, inviteText(interaction.user.id, count))],
+          embeds: [embed(null, inviteText(name, name, count))],
           allowedMentions: NO_MENTIONS,
         });
       } catch (err) {
