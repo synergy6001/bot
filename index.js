@@ -890,9 +890,10 @@ const commands = [
       const rewards = embed('The rewards are as follows:', 'Note that this event is ending on Oct 20th.')
         .setAuthor({ name: 'Rewards', iconURL: ARROW_ICON })
         .addFields(
-          REWARDS.map((r) => ({
-            name: `${emojiText(r.emoji)} ${r.name}`,
-            value: `Invite **${r.invites} people** to claim⤴`,
+          REWARDS.map((r, i) => ({
+            name: `${emojiText(r.emoji)} ${r.name} • ${r.invites} invites`,
+            // Invisible extra line adds a gap between rewards (not after the last one).
+            value: `Invite **${r.invites} people** to claim⤴${i < REWARDS.length - 1 ? '\n\u200b' : ''}`,
           })),
         );
 
