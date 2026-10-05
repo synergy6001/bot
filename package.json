@@ -4,7 +4,8 @@
   "description": "A simple, low-memory Discord invite tracker using slash commands only.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "npm rebuild better-sqlite3"
   },
   "engines": {
     "node": ">=20"
@@ -14,5 +15,8 @@
     "better-sqlite3": "^12.2.0",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
   }
 }
