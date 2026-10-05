@@ -485,6 +485,7 @@ const REWARDS = [
   { id: 'propass', name: 'Pro Pass', invites: 9, emoji: { id: '1500798443961061476', name: 'propass' } },
 ];
 
+const ARROW_ICON = 'https://cdn.discordapp.com/emojis/1556702446104088646.png';
 const emojiText = (e) => `<:${e.name}:${e.id}>`;
 
 /** The private claim menu. The user's current invite total is always shown at the top. */
@@ -505,7 +506,7 @@ function claimPayload(guildId, userId, notice) {
     );
 
   return {
-    embeds: [embed('Claim a reward', `${top}\n\n${notice ?? 'Select the reward you want to claim below.'}`)],
+    embeds: [embed('📥 Claim a reward', `${top}\n\n${notice ?? 'Select the reward you want to claim below.'}`)],
     components: [new ActionRowBuilder().addComponents(menu)],
     allowedMentions: NO_MENTIONS,
   };
@@ -855,16 +856,16 @@ const commands = [
           'such as inviting other members to the server. How do we profit from this? It\'s simple - we have a method ' +
           'that lets us buy goodies for way cheaper (basically almost free), meaning it\'s a win-win situation since ' +
           'we get members and potential customers, and our members earn in-game items.',
-      ).setAuthor({ name: 'Introduction' });
+      ).setAuthor({ name: 'Introduction', iconURL: ARROW_ICON });
 
       const safety = embed(
         'How safe is this?',
         "We purchase items in a legal manner and from a legitimate store, therefore we've never had problems " +
           'with revokes and such. We do not require logging into your account, just your player tag.',
-      ).setAuthor({ name: 'Safety' });
+      ).setAuthor({ name: 'Safety', iconURL: ARROW_ICON });
 
       const getStarted = embed('How do I get started?')
-        .setAuthor({ name: 'Process' })
+        .setAuthor({ name: 'Process', iconURL: ARROW_ICON })
         .addFields(
           {
             name: '1. Start inviting people to the server',
@@ -887,7 +888,7 @@ const commands = [
         );
 
       const rewards = embed('The rewards are as follows:', 'Note that this event is ending on Oct 20th.')
-        .setAuthor({ name: 'Rewards' })
+        .setAuthor({ name: 'Rewards', iconURL: ARROW_ICON })
         .addFields(
           REWARDS.map((r) => ({
             name: `${emojiText(r.emoji)} ${r.name}`,
@@ -897,7 +898,7 @@ const commands = [
 
       // banner.png / logo.png are read from the same folder as index.js.
       const files = [];
-      const footer = { text: 'FreePass • 🎁│brawl-rewards' };
+      const footer = { text: 'FreePass - The only legit place to get freebies!' };
       const bannerPath = path.resolve(__dirname, 'banner.png');
       const logoPath = path.resolve(__dirname, 'logo.png');
       if (fs.existsSync(bannerPath)) {
