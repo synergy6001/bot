@@ -7,6 +7,7 @@ const path = require('node:path');
 const Database = require('better-sqlite3');
 const {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
@@ -23,6 +24,7 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
 } = require('discord.js');
 
 // ===========================================================================
@@ -472,6 +474,66 @@ function handleLeave(member) {
 // ===========================================================================
 // 5. SLASH COMMANDS
 // ===========================================================================
+// ---- Rewards: public Claim button + reward menu (usable by everyone) ----
+const CLAIM_BUTTON_ID = 'rewards:claim';
+const CLAIM_SELECT_ID = 'rewards:select';
+const REVIEWS_URL = 'https://discord.com/channels/1379048382684987463/1381262550347415593';
+
+const REWARDS = [
+  { id: 'pass', name: 'Brawl Pass', invites: 3, emoji: { id: '1556695553025515560', name: 'pass' } },
+  { id: 'passplus', name: 'Brawl Pass Plus', invites: 6, emoji: { id: '1500797805353107648', name: 'passplus' } },
+  { id: 'propass', name: 'Pro Pass', invites: 9, emoji: { id: '1500798443961061476', name: 'propass' } },
+];
+
+const emojiText = (e) => `<:${e.name}:${e.id}>`;
+
+/** The private claim menu. The user's current invite total is always shown at the top. */
+function claimPayload(guildId, userId, notice) {
+  const { current } = getStats(guildId, userId);
+  const top = `You currently have **${current}** ${current === 1 ? 'invite' : 'invites'}.`;
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(CLAIM_SELECT_ID)
+    .setPlaceholder('Select a reward')
+    .addOptions(
+      REWARDS.map((r) => ({
+        label: r.name,
+        description: `Price: ${r.invites} invites`,
+        value: r.id,
+        emoji: r.emoji,
+      })),
+    );
+
+  return {
+    embeds: [embed('Claim a reward', `${top}\n\n${notice ?? 'Select the reward you want to claim below.'}`)],
+    components: [new ActionRowBuilder().addComponents(menu)],
+    allowedMentions: NO_MENTIONS,
+  };
+}
+
+async function handleClaimButton(interaction) {
+  await interaction.reply({
+    ...claimPayload(interaction.guildId, interaction.user.id),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleClaimSelect(interaction) {
+  const reward = REWARDS.find((r) => r.id === interaction.values[0]);
+  if (!reward) {
+    await interaction.deferUpdate();
+    return;
+  }
+  // Placeholder: claiming isn't built yet, so every selection says "not enough".
+  await interaction.update(
+    claimPayload(
+      interaction.guildId,
+      interaction.user.id,
+      `❌ You don't have enough invites to claim **${reward.name}**.`,
+    ),
+  );
+}
+
 const commands = [
   // /set channel:<text channel>
   {
@@ -801,7 +863,7 @@ const commands = [
           'with revokes and such. We do not require logging into your account, just your player tag.',
       ).setAuthor({ name: 'Safety' });
 
-      const process = embed('How do I get started?')
+      const getStarted = embed('How do I get started?')
         .setAuthor({ name: 'Process' })
         .addFields(
           {
@@ -813,21 +875,61 @@ const commands = [
           {
             name: '2. Get enough invites',
             value:
-              'Check your invites using the "Check Invites" button below, once you have enough for your desired ' +
+              'Check your invites using the "Claim" button below, once you have enough for your desired ' +
               'reward continue to the next step.',
           },
           {
             name: '3. Claim your reward',
             value:
-              'Head to <#1502298394209550567> and follow the automated process, the item will be sent to you ' +
-              "within 10 minutes and you'll be asked to leave a vouch. Enjoy!",
+              'Press the "Claim" button below, select your reward and follow the automated process, the item ' +
+              "will be sent to you within 10 minutes and you'll be asked to leave a vouch. Enjoy!",
           },
         );
+
+      const rewards = embed('The rewards are as follows:', 'Note that this event is ending on Oct 20th.')
+        .setAuthor({ name: 'Rewards' })
+        .addFields(
+          REWARDS.map((r) => ({
+            name: `${emojiText(r.emoji)} ${r.name}`,
+            value: `Invite **${r.invites} people** to claim⤴`,
+          })),
+        );
+
+      // banner.png / logo.png are read from the same folder as index.js.
+      const files = [];
+      const footer = { text: 'FreePass • 🎁│brawl-rewards' };
+      const bannerPath = path.resolve(__dirname, 'banner.png');
+      const logoPath = path.resolve(__dirname, 'logo.png');
+      if (fs.existsSync(bannerPath)) {
+        files.push(new AttachmentBuilder(bannerPath, { name: 'banner.png' }));
+        rewards.setImage('attachment://banner.png');
+      } else {
+        console.warn(`banner.png not found at ${bannerPath}; posting without the banner.`);
+      }
+      if (fs.existsSync(logoPath)) {
+        files.push(new AttachmentBuilder(logoPath, { name: 'logo.png' }));
+        footer.iconURL = 'attachment://logo.png';
+      } else {
+        console.warn(`logo.png not found at ${logoPath}; posting without the footer logo.`);
+      }
+      rewards.setFooter(footer);
+
+      // Gray buttons: Secondary for Claim; link buttons are always gray in Discord.
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(CLAIM_BUTTON_ID)
+          .setLabel('Claim')
+          .setEmoji('📥')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setLabel('Reviews').setEmoji('⭐').setStyle(ButtonStyle.Link).setURL(REVIEWS_URL),
+      );
 
       // channel.send posts a brand new message; it is not a reply to the command.
       try {
         await channel.send({
-          embeds: [introduction, safety, process],
+          embeds: [introduction, safety, getStarted, rewards],
+          files,
+          components: [buttons],
           allowedMentions: NO_MENTIONS,
         });
       } catch (err) {
@@ -930,9 +1032,21 @@ client.on(Events.GuildMemberRemove, (member) => {
   handleLeave(member).catch((err) => console.error('guildMemberRemove error:', err));
 });
 
-// Owner-only access control runs first, for every interaction (commands and buttons).
+// Owner-only access control for commands. The public rewards Claim button and menu
+// are handled first because every member needs to be able to use them.
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.inGuild()) {
+      if (interaction.isButton() && interaction.customId === CLAIM_BUTTON_ID) {
+        await handleClaimButton(interaction);
+        return;
+      }
+      if (interaction.isStringSelectMenu() && interaction.customId === CLAIM_SELECT_ID) {
+        await handleClaimSelect(interaction);
+        return;
+      }
+    }
+
     if (interaction.user.id !== OWNER_ID) {
       if (interaction.isRepliable()) {
         await safeReply(interaction, {
