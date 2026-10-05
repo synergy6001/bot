@@ -35,7 +35,7 @@ if (!DISCORD_TOKEN || !OWNER_ID) {
   process.exit(1);
 }
 
-const COLOR = 0x5865f2; // one consistent embed color
+const COLOR = 0xfbd834; // one consistent embed color
 const NO_MENTIONS = { parse: [] }; // nothing the bot sends can ping anyone
 const DELETED_TTL_MS = 15_000;
 const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
@@ -414,32 +414,26 @@ async function detectInvite(guild) {
   return unknown;
 }
 
+/** The one-line invite announcement. Shared by real joins and /test. */
+function inviteText(inviterId, count) {
+  return `🎉 <@${inviterId}> got a new invite!\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}.`;
+}
+
 async function sendJoinMessage(member, detected) {
   const channel = await getTrackingChannel(member.guild);
   if (!channel) return;
 
-  let inviterText = 'Unknown';
-  let countText = 'N/A';
+  let text;
   if (detected.source === 'vanity') {
-    inviterText = 'Vanity URL';
+    text = `<@${member.id}> joined via the vanity URL.`;
   } else if (detected.inviterId) {
-    inviterText = `<@${detected.inviterId}>`;
-    countText = String(getStats(member.guild.id, detected.inviterId).current);
+    text = inviteText(detected.inviterId, getStats(member.guild.id, detected.inviterId).current);
+  } else {
+    text = `<@${member.id}> joined (inviter unknown).`;
   }
 
-  const created = member.user.createdTimestamp;
-  const message = embed('Member joined')
-    .setThumbnail(member.user.displayAvatarURL())
-    .addFields(
-      { name: 'Member', value: `<@${member.id}>`, inline: true },
-      { name: 'Invited by', value: inviterText, inline: true },
-      { name: "Inviter's invites", value: countText, inline: true },
-      { name: 'Account created', value: `${fullDate(created)} (${relativeDate(created)})` },
-    )
-    .setTimestamp();
-
   try {
-    await channel.send({ embeds: [message], allowedMentions: NO_MENTIONS });
+    await channel.send({ embeds: [embed(null, text)], allowedMentions: NO_MENTIONS });
   } catch (err) {
     console.warn(`[${member.guild.name}] Could not send join message:`, err.message);
   }
@@ -733,6 +727,36 @@ const commands = [
             },
           ),
       );
+    },
+  },
+
+  // /test
+  {
+    data: new SlashCommandBuilder()
+      .setName('test')
+      .setDescription('Post a sample invite message in the tracking channel (you as inviter and invitee)')
+      .setContexts(InteractionContextType.Guild),
+
+    async execute(interaction) {
+      const channel = await getTrackingChannel(interaction.guild);
+      if (!channel) {
+        await send(interaction, embed(null, 'No tracking channel is set. Use `/set` first.'), { ephemeral: true });
+        return;
+      }
+
+      // Preview only: nothing is written to the database. Shows the count as if
+      // this were a real invite (current + 1).
+      const count = getStats(interaction.guildId, interaction.user.id).current + 1;
+      try {
+        await channel.send({
+          embeds: [embed(null, inviteText(interaction.user.id, count))],
+          allowedMentions: NO_MENTIONS,
+        });
+      } catch (err) {
+        await send(interaction, embed(null, `Couldn't post in <#${channel.id}>: ${err.message}`), { ephemeral: true });
+        return;
+      }
+      await send(interaction, embed(null, `Test message sent to <#${channel.id}>.`), { ephemeral: true });
     },
   },
 ];
