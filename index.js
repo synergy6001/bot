@@ -1,5 +1,5 @@
 // index.js - Discord invite tracker (single file).
-// discord.js v14, better-sqlite3, slash commands only, no message content intent.
+// discord.js v14, better-sqlite3, slash commands. Message content is only read for /placeholder lists.
 require('dotenv').config();
 
 const fs = require('node:fs');
@@ -1068,6 +1068,184 @@ async function handleUserPanel(interaction) {
   await interaction.deferUpdate().catch(() => {});
 }
 
+// ---- /placeholder: sample invite messages to preview an active server ----
+// Owner only, off by default, in-memory only (a restart turns it off).
+//   /placeholder inviters  -> then send a message mentioning the inviters (e.g. 20 @mentions)
+//   /placeholder invitees  -> then send a message mentioning the invitees
+//   /placeholder start     -> posts in the channel you run it in
+//   /placeholder stop      -> stops and clears everything
+// Every 3 to 10 minutes one random inviter "invites" one random invitee. An invitee is used once and then
+// removed; an inviter is removed once they reach PLACEHOLDER_MAX_INVITES. When either list runs out it
+// switches itself off. It never touches the database, stats or real invites, and the invite display cap
+// does NOT apply to these messages.
+const PLACEHOLDER_MAX_INVITES = 6;
+const PLACEHOLDER_MIN_DELAY_MS = 3 * 60_000;
+const PLACEHOLDER_MAX_DELAY_MS = 10 * 60_000;
+const PLACEHOLDER_CAPTURE_MS = 5 * 60_000; // how long the bot waits for your mentions message
+
+const placeholderRuns = new Map(); // guildId -> { channelId, timer, inviters: [{ id, name, count }], invitees: [{ id, name }] }
+const placeholderSetup = new Map(); // guildId -> { inviters: [{ id, name }], invitees: [{ id, name }] }
+const placeholderPending = new Map(); // `${guildId}:${userId}` -> { type, interaction, timer }
+
+const randomItem = (list) => list[Math.floor(Math.random() * list.length)];
+
+function getSetup(guildId) {
+  let setup = placeholderSetup.get(guildId);
+  if (!setup) {
+    setup = { inviters: [], invitees: [] };
+    placeholderSetup.set(guildId, setup);
+  }
+  return setup;
+}
+
+/** Looks up display names for user ids (skips bots and people who left). */
+async function resolvePlaceholderMembers(guild, ids) {
+  const list = [...ids];
+  const found = [];
+  for (let i = 0; i < list.length; i += 5) {
+    const results = await Promise.all(
+      list.slice(i, i + 5).map(async (id) => {
+        const member = guild.members.cache.get(id) ?? (await guild.members.fetch(id).catch(() => null));
+        return member && !member.user.bot ? { id, name: member.displayName } : null;
+      }),
+    );
+    found.push(...results.filter(Boolean));
+  }
+  return found;
+}
+
+function cancelPlaceholderPending(key) {
+  const pending = placeholderPending.get(key);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  placeholderPending.delete(key);
+}
+
+/** Clears the run, saved lists and any waiting capture for a guild. Returns true if a run was active. */
+function stopPlaceholder(guildId) {
+  placeholderSetup.delete(guildId);
+  for (const key of [...placeholderPending.keys()]) {
+    if (key.startsWith(`${guildId}:`)) cancelPlaceholderPending(key);
+  }
+  const run = placeholderRuns.get(guildId);
+  if (!run) return false;
+  clearTimeout(run.timer);
+  placeholderRuns.delete(guildId);
+  return true;
+}
+
+function schedulePlaceholder(guildId) {
+  const run = placeholderRuns.get(guildId);
+  if (!run) return;
+
+  if (run.inviters.length === 0 || run.invitees.length === 0) {
+    console.log(`[placeholder] Finished in guild ${guildId}: ran out of names.`);
+    stopPlaceholder(guildId);
+    return;
+  }
+
+  // Random gap of 3 to 10 minutes so it doesn't look like a clock.
+  const delay = PLACEHOLDER_MIN_DELAY_MS + Math.floor(Math.random() * (PLACEHOLDER_MAX_DELAY_MS - PLACEHOLDER_MIN_DELAY_MS));
+  run.timer = setTimeout(async () => {
+    if (placeholderRuns.get(guildId) !== run) return;
+
+    const inviter = randomItem(run.inviters);
+    // Never let someone invite themselves if they are in both lists.
+    const options = run.invitees.filter((m) => m.id !== inviter.id);
+    if (options.length === 0) {
+      console.log(`[placeholder] Finished in guild ${guildId}: no valid invitees left.`);
+      stopPlaceholder(guildId);
+      return;
+    }
+    const invitee = randomItem(options);
+
+    try {
+      const channel = await client.channels.fetch(run.channelId);
+      if (!channel?.isTextBased()) throw new Error('Channel is not text based.');
+      // No display cap here: the real count is shown (the cap only applies to real invite messages).
+      await channel.send({
+        embeds: [embed(null, inviteText(escapeMarkdown(inviter.name), escapeMarkdown(invitee.name), inviter.count + 1))],
+        allowedMentions: NO_MENTIONS,
+      });
+    } catch (err) {
+      console.warn(`[placeholder] Stopping in guild ${guildId}:`, err.message);
+      stopPlaceholder(guildId);
+      return;
+    }
+
+    // Only update the lists once the message was actually posted.
+    inviter.count += 1;
+    run.invitees.splice(run.invitees.indexOf(invitee), 1); // each invitee is used once
+    if (inviter.count >= PLACEHOLDER_MAX_INVITES) {
+      run.inviters.splice(run.inviters.indexOf(inviter), 1); // reached the max, so they're done
+    }
+    schedulePlaceholder(guildId);
+  }, delay);
+}
+
+/** /placeholder inviters | invitees: waits for the owner's next message that mentions people. */
+async function beginPlaceholderCapture(interaction, type) {
+  const key = `${interaction.guildId}:${interaction.user.id}`;
+  cancelPlaceholderPending(key);
+
+  const timer = setTimeout(() => {
+    placeholderPending.delete(key);
+    interaction
+      .editReply({ embeds: [embed(null, `Timed out waiting for the ${type}. Run the command again.`)] })
+      .catch(() => {});
+  }, PLACEHOLDER_CAPTURE_MS);
+  placeholderPending.set(key, { type, interaction, timer });
+
+  await send(
+    interaction,
+    embed(
+      null,
+      `Now send a message that mentions the **${type}** (as many as you like). I'll pick up the next one you send.\n\n` +
+        'Tip: start the message with `@silent ` so the people you mention don\'t get notified.',
+    ),
+    { ephemeral: true },
+  );
+}
+
+/** MessageCreate: completes a pending /placeholder inviters | invitees. */
+async function handlePlaceholderMessage(message) {
+  if (message.author.bot || !message.guildId) return;
+  const key = `${message.guildId}:${message.author.id}`;
+  const pending = placeholderPending.get(key);
+  if (!pending) return;
+
+  const ids = new Set(message.mentions.users.keys());
+  for (const m of message.content.matchAll(/<@!?(\d{17,20})>/g)) ids.add(m[1]);
+  if (ids.size === 0) return; // not a mentions message, keep waiting
+
+  cancelPlaceholderPending(key);
+  const members = await resolvePlaceholderMembers(message.guild, ids);
+  const skipped = ids.size - members.length;
+
+  if (members.length === 0) {
+    await pending.interaction
+      .editReply({ embeds: [embed(null, `I couldn't use any of those mentions (bots or people who left). Run the command again.`)] })
+      .catch(() => {});
+    return;
+  }
+
+  const setup = getSetup(message.guildId);
+  setup[pending.type] = members;
+
+  const other = pending.type === 'inviters' ? 'invitees' : 'inviters';
+  const next = setup[other].length === 0 ? `Next: \`/placeholder ${other}\`.` : 'Ready: run `/placeholder start` in the channel to post in.';
+  const note = skipped > 0 ? ` (${skipped} skipped: bots or people who left)` : '';
+  await pending.interaction
+    .editReply({
+      embeds: [embed(null, `Saved **${members.length}** ${pending.type}${note}. ${next}`)],
+    })
+    .catch(() => {});
+}
+
+function dropPlaceholderGuild(guildId) {
+  stopPlaceholder(guildId);
+}
+
 const commands = [
   // /set type:<Invite tracking | Claim logs> channel:<text channel>
   {
@@ -1225,6 +1403,86 @@ const commands = [
       const user = interaction.options.getUser('user', true);
       await interaction.deferReply();
       await interaction.editReply(await userPanelPayload(interaction.guild, user.id));
+    },
+  },
+
+  // /placeholder inviters | invitees | start | stop
+  {
+    data: new SlashCommandBuilder()
+      .setName('placeholder')
+      .setDescription('Sample invite messages (off by default)')
+      .setContexts(InteractionContextType.Guild)
+      .addSubcommand((sub) =>
+        sub.setName('inviters').setDescription('Set the inviters, then send a message mentioning them'))
+      .addSubcommand((sub) =>
+        sub.setName('invitees').setDescription('Set the invitees, then send a message mentioning them'))
+      .addSubcommand((sub) =>
+        sub.setName('start').setDescription('Start posting sample invites in this channel'))
+      .addSubcommand((sub) =>
+        sub.setName('stop').setDescription('Stop posting and clear the lists')),
+
+    async execute(interaction) {
+      const guildId = interaction.guild.id;
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'stop') {
+        const wasRunning = stopPlaceholder(guildId);
+        await send(
+          interaction,
+          embed(null, wasRunning ? 'Placeholder messages are now **off**.' : 'Placeholder lists cleared. Nothing was running.'),
+          { ephemeral: true },
+        );
+        return;
+      }
+
+      if (sub === 'inviters' || sub === 'invitees') {
+        if (placeholderRuns.has(guildId)) {
+          await send(interaction, embed(null, 'Already running. Use `/placeholder stop` first.'), { ephemeral: true });
+          return;
+        }
+        await beginPlaceholderCapture(interaction, sub);
+        return;
+      }
+
+      // start
+      if (placeholderRuns.has(guildId)) {
+        await send(interaction, embed(null, 'Already running. Use `/placeholder stop` to turn it off.'), { ephemeral: true });
+        return;
+      }
+      if (!interaction.channel?.isTextBased()) {
+        await send(interaction, embed(null, 'Run this in a text channel.'), { ephemeral: true });
+        return;
+      }
+      const setup = placeholderSetup.get(guildId);
+      if (!setup || setup.inviters.length === 0 || setup.invitees.length === 0) {
+        const missing = [!setup?.inviters.length && '`/placeholder inviters`', !setup?.invitees.length && '`/placeholder invitees`']
+          .filter(Boolean)
+          .join(' and ');
+        await send(interaction, embed(null, `Set the lists first: ${missing}.`), { ephemeral: true });
+        return;
+      }
+
+      placeholderRuns.set(guildId, {
+        channelId: interaction.channelId,
+        timer: null,
+        inviters: setup.inviters.map((m) => ({ ...m, count: 0 })),
+        invitees: [...setup.invitees],
+      });
+      placeholderSetup.delete(guildId);
+      schedulePlaceholder(guildId);
+
+      const n1 = setup.inviters.length;
+      const n2 = setup.invitees.length;
+      await send(
+        interaction,
+        embed(
+          null,
+          `Placeholder messages are now **on** in <#${interaction.channelId}> with **${n1}** ` +
+            `${n1 === 1 ? 'inviter' : 'inviters'} and **${n2}** ${n2 === 1 ? 'invitee' : 'invitees'}. ` +
+            'Use `/placeholder stop` to turn them off.',
+        ),
+        { ephemeral: true },
+      );
     },
   },
 
@@ -1505,7 +1763,14 @@ async function registerCommands(client) {
 // ===========================================================================
 // Only the intents we need, and tight caches for a 256 MB host.
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildInvites,
+    // Only used so /placeholder can read the owner's pasted mentions (privileged intent, see notes).
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
   allowedMentions: NO_MENTIONS,
   makeCache: Options.cacheWithLimits({
     ...Options.DefaultMakeCacheSettings,
@@ -1546,7 +1811,10 @@ client.on(Events.GuildCreate, (guild) => {
   cacheGuildInvites(guild).catch((err) => console.error('Invite cache error:', err));
 });
 
-client.on(Events.GuildDelete, (guild) => dropGuild(guild.id));
+client.on(Events.GuildDelete, (guild) => {
+  dropPlaceholderGuild(guild.id);
+  dropGuild(guild.id);
+});
 
 client.on(Events.InviteCreate, (invite) => {
   try {
@@ -1566,6 +1834,10 @@ client.on(Events.InviteDelete, (invite) => {
 
 client.on(Events.GuildMemberAdd, (member) => {
   handleJoin(member).catch((err) => console.error('guildMemberAdd error:', err));
+});
+
+client.on(Events.MessageCreate, (message) => {
+  handlePlaceholderMessage(message).catch((err) => console.error('placeholder message error:', err));
 });
 
 client.on(Events.GuildMemberRemove, (member) => {
