@@ -12,7 +12,6 @@ const {
   ButtonStyle,
   ChannelType,
   Client,
-  ComponentType,
   EmbedBuilder,
   escapeMarkdown,
   Events,
@@ -120,7 +119,12 @@ const q = {
     INSERT INTO inviter_stats (guild_id, inviter_id, joins, leaves) VALUES (?, ?, 1, 0)
     ON CONFLICT(guild_id, inviter_id) DO UPDATE SET joins = joins + 1`),
   addLeaveStat: db.prepare(
-    'UPDATE inviter_stats SET leaves = leaves + 1 WHERE guild_id = ? AND inviter_id = ?'),
+    'UPDATE inviter_stats SET leaves = MIN(leaves + 1, joins) WHERE guild_id = ? AND inviter_id = ?'),
+  addJoinsBy: db.prepare(`
+    INSERT INTO inviter_stats (guild_id, inviter_id, joins, leaves) VALUES (?, ?, ?, 0)
+    ON CONFLICT(guild_id, inviter_id) DO UPDATE SET joins = joins + excluded.joins`),
+  addLeavesBy: db.prepare(
+    'UPDATE inviter_stats SET leaves = leaves + ? WHERE guild_id = ? AND inviter_id = ?'),
   stats: db.prepare('SELECT joins, leaves FROM inviter_stats WHERE guild_id = ? AND inviter_id = ?'),
   leaderboard: db.prepare(`
     SELECT inviter_id, joins, leaves, (joins - leaves) AS current
@@ -210,10 +214,25 @@ function getLeaderboard(guildId, limit = 10) {
   }));
 }
 
-/** Resets stats. Old join records stay (for /whoinvited) but stop counting. */
+/** Resets stats. Old join records stay (for /user) but stop counting. */
 const resetStats = db.transaction((guildId, inviterId) => {
   q.deleteStats.run(guildId, inviterId);
   q.uncountJoins.run(guildId, inviterId);
+});
+
+/**
+ * Adds (positive delta) or removes (negative delta) invites by hand. Additions count as joins,
+ * removals as leaves, and removing never takes the total below 0.
+ * Returns how many invites were actually added or removed.
+ */
+const adjustInvites = db.transaction((guildId, inviterId, delta) => {
+  if (delta > 0) {
+    q.addJoinsBy.run(guildId, inviterId, delta);
+    return delta;
+  }
+  const take = Math.min(-delta, getStats(guildId, inviterId).current);
+  if (take > 0) q.addLeavesBy.run(take, guildId, inviterId);
+  return take;
 });
 
 // ===========================================================================
@@ -567,7 +586,7 @@ function claimPayload(guildId, userId) {
 /** Step 2/3: ask for the player tag. Typing happens in a popup form (no message content intent needed). */
 function tagPayload(reward) {
   const e = embed(
-    `Selected: ${reward.name}`,
+    `Selected: ${emojiText(reward.emoji)} ${reward.name}`,
     'Press the button below and enter your Brawl Stars **player tag**, this is where your reward will be sent.\n\n' +
       '**Example:**',
   ).setFooter(stepFooter(2));
@@ -746,6 +765,138 @@ async function handleTagModal(interaction) {
   await logClaimAttempt(interaction, { reward, tag, have, success });
 }
 
+// ---- /user panel: member info plus owner-only Add / Remove / Reset buttons ----
+const USER_PREFIX = 'user:'; // customIds look like user:<action>:<userId>
+const USER_AMOUNT_ID = 'user:amount';
+
+/** Builds the /user embed + buttons. `notice` is an optional line shown under the mention. */
+async function userPanelPayload(guild, userId, notice) {
+  const user = await guild.client.users.fetch(userId);
+  const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+  const stats = getStats(guild.id, userId);
+  const record = getLatestJoin(guild.id, userId);
+  const avatar = user.displayAvatarURL();
+  const displayName = member?.displayName ?? user.globalName ?? user.username;
+
+  const joinedAt = member?.joinedTimestamp ?? record?.joined_at ?? null;
+  let status = 'Not in the server';
+  if (member) status = 'In the server';
+  else if (record?.left_at) status = `Left ${fullDate(record.left_at)}`;
+
+  const e = embed(null, `<@${userId}>${notice ? `\n\n${notice}` : ''}`)
+    .setAuthor({ name: user.username, iconURL: avatar })
+    .setThumbnail(avatar)
+    .addFields(
+      { name: 'Username', value: escapeMarkdown(user.username), inline: true },
+      { name: 'Display name', value: escapeMarkdown(displayName), inline: true },
+      { name: 'User ID', value: `\`${user.id}\``, inline: true },
+      { name: 'Current invites', value: String(stats.current), inline: true },
+      { name: 'Total joins', value: String(stats.joins), inline: true },
+      { name: 'Leaves', value: String(stats.leaves), inline: true },
+      { name: 'Account created', value: `${fullDate(user.createdTimestamp)} (${relativeDate(user.createdTimestamp)})` },
+      {
+        name: 'Joined server',
+        value: joinedAt ? `${fullDate(joinedAt)} (${relativeDate(joinedAt)})` : 'Unknown',
+      },
+      { name: 'Status', value: status },
+    );
+
+  if (record) {
+    e.addFields(
+      { name: 'Invited by', value: describeInviter(record), inline: true },
+      { name: 'Invite code', value: record.invite_code ? `\`${record.invite_code}\`` : 'N/A', inline: true },
+    );
+  } else {
+    e.addFields({
+      name: 'Invited by',
+      value: 'No join record. They may have joined before the bot started tracking.',
+    });
+  }
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${USER_PREFIX}add:${userId}`).setLabel('Add').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`${USER_PREFIX}remove:${userId}`).setLabel('Remove').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`${USER_PREFIX}reset:${userId}`).setLabel('Reset').setStyle(ButtonStyle.Danger),
+  );
+
+  return { embeds: [e], components: [buttons], allowedMentions: NO_MENTIONS };
+}
+
+const errorReply = (text) => ({
+  embeds: [embed(null, text).setColor(ERROR_COLOR)],
+  flags: MessageFlags.Ephemeral,
+});
+
+/** Buttons and popups from the /user panel. Only reached by the owner (checked in InteractionCreate). */
+async function handleUserPanel(interaction) {
+  const [, action, userId] = interaction.customId.split(':');
+  if (!/^\d+$/.test(userId ?? '')) {
+    await safeReply(interaction, errorReply('Something went wrong. Run `/user` again.'));
+    return;
+  }
+  const guild = interaction.guild;
+  const plural = (n) => (n === 1 ? 'invite' : 'invites');
+
+  // Add / Remove: open the amount popup.
+  if (interaction.isButton() && (action === 'add' || action === 'remove')) {
+    const input = new TextInputBuilder()
+      .setCustomId(USER_AMOUNT_ID)
+      .setLabel(action === 'add' ? 'How many invites to add?' : 'How many invites to remove?')
+      .setPlaceholder('e.g: 3')
+      .setStyle(TextInputStyle.Short)
+      .setMinLength(1)
+      .setMaxLength(6)
+      .setRequired(true);
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`${USER_PREFIX}modal-${action}:${userId}`)
+        .setTitle(action === 'add' ? 'Add invites' : 'Remove invites')
+        .addComponents(new ActionRowBuilder().addComponents(input)),
+    );
+    return;
+  }
+
+  // Reset: back to 0 straight away.
+  if (interaction.isButton() && action === 'reset') {
+    resetStats(guild.id, userId);
+    await interaction.deferUpdate();
+    await interaction.editReply(await userPanelPayload(guild, userId, '✅ Invites reset to 0.'));
+    return;
+  }
+
+  // Amount popup submitted.
+  if (interaction.isModalSubmit() && (action === 'modal-add' || action === 'modal-remove')) {
+    if (!interaction.isFromMessage()) {
+      await safeReply(interaction, errorReply('Something went wrong. Run `/user` again.'));
+      return;
+    }
+
+    const raw = interaction.fields.getTextInputValue(USER_AMOUNT_ID).trim();
+    const amount = /^\d{1,6}$/.test(raw) ? Number(raw) : 0;
+    if (amount < 1) {
+      await safeReply(interaction, errorReply('Enter a whole number greater than 0.'));
+      return;
+    }
+
+    let notice;
+    if (action === 'modal-add') {
+      adjustInvites(guild.id, userId, amount);
+      notice = `✅ Added **${amount}** ${plural(amount)}.`;
+    } else {
+      const removed = adjustInvites(guild.id, userId, -amount);
+      if (removed === 0) notice = 'ℹ️ They have no invites to remove.';
+      else if (removed < amount) notice = `✅ Removed **${removed}** ${plural(removed)} (all they had).`;
+      else notice = `✅ Removed **${removed}** ${plural(removed)}.`;
+    }
+
+    await interaction.deferUpdate();
+    await interaction.editReply(await userPanelPayload(guild, userId, notice));
+    return;
+  }
+
+  await interaction.deferUpdate().catch(() => {});
+}
+
 const commands = [
   // /set type:<Invite tracking | Claim logs> channel:<text channel>
   {
@@ -840,8 +991,9 @@ const commands = [
     },
   },
 
-  // /invites user:<optional>
+  // /invites user:<optional>  (public: the only command everyone can use)
   {
+    public: true,
     data: new SlashCommandBuilder()
       .setName('invites')
       .setDescription("Show a member's invite stats")
@@ -890,117 +1042,18 @@ const commands = [
     },
   },
 
-  // /whoinvited user:<required>
+  // /user user:<required>  (replaces /whoinvited and /resetinvites)
   {
     data: new SlashCommandBuilder()
-      .setName('whoinvited')
-      .setDescription('Show who invited a member')
+      .setName('user')
+      .setDescription("Show a member's info and manage their invites")
       .addUserOption((o) => o.setName('user').setDescription('The member to look up').setRequired(true))
       .setContexts(InteractionContextType.Guild),
 
     async execute(interaction) {
       const user = interaction.options.getUser('user', true);
-      const record = getLatestJoin(interaction.guildId, user.id);
-
-      if (!record) {
-        await send(
-          interaction,
-          embed(
-            'No record found',
-            `I have no join record for <@${user.id}>. They may have joined before the bot started tracking.`,
-          ),
-        );
-        return;
-      }
-
-      await send(
-        interaction,
-        embed('Who invited', `Latest join record for <@${user.id}>`)
-          .setThumbnail(user.displayAvatarURL())
-          .addFields(
-            { name: 'Invited by', value: describeInviter(record), inline: true },
-            { name: 'Invite code', value: record.invite_code ? `\`${record.invite_code}\`` : 'N/A', inline: true },
-            { name: 'Joined', value: `${fullDate(record.joined_at)} (${relativeDate(record.joined_at)})` },
-            {
-              name: 'Status',
-              value: record.left_at ? `Left ${fullDate(record.left_at)}` : 'Still in the server',
-            },
-          ),
-      );
-    },
-  },
-
-  // /resetinvites user:<required> (with confirmation button, 60 s timeout)
-  {
-    data: new SlashCommandBuilder()
-      .setName('resetinvites')
-      .setDescription("Reset a user's invite stats")
-      .addUserOption((o) =>
-        o.setName('user').setDescription('The user whose stats will be reset').setRequired(true),
-      )
-      .setContexts(InteractionContextType.Guild),
-
-    async execute(interaction) {
-      const user = interaction.options.getUser('user', true);
-      const stats = getStats(interaction.guildId, user.id);
-      const suffix = interaction.id;
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`reset-confirm:${suffix}`)
-          .setLabel('Confirm reset')
-          .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-          .setCustomId(`reset-cancel:${suffix}`)
-          .setLabel('Cancel')
-          .setStyle(ButtonStyle.Secondary),
-      );
-
-      await interaction.reply({
-        embeds: [
-          embed(
-            'Confirm reset',
-            `Reset invite stats for <@${user.id}>?\n` +
-              `Current: **${stats.current}**, joins: **${stats.joins}**, leaves: **${stats.leaves}**.\n` +
-              'This cannot be undone. You have 60 seconds to confirm.',
-          ),
-        ],
-        components: [row],
-        allowedMentions: NO_MENTIONS,
-      });
-      const message = await interaction.fetchReply();
-
-      try {
-        const choice = await message.awaitMessageComponent({
-          componentType: ComponentType.Button,
-          time: 60_000,
-          filter: (i) => i.user.id === OWNER_ID && i.customId.endsWith(`:${suffix}`),
-        });
-
-        if (choice.customId.startsWith('reset-confirm')) {
-          resetStats(interaction.guildId, user.id);
-          await choice.update({
-            embeds: [embed('Stats reset', `Invite stats for <@${user.id}> have been reset.`)],
-            components: [],
-            allowedMentions: NO_MENTIONS,
-          });
-        } else {
-          await choice.update({
-            embeds: [embed('Cancelled', 'No changes were made.')],
-            components: [],
-            allowedMentions: NO_MENTIONS,
-          });
-        }
-      } catch {
-        // awaitMessageComponent rejects when the 60 seconds run out.
-        await interaction
-          .editReply({
-            embeds: [embed('Timed out', 'No confirmation received. No changes were made.')],
-            components: [],
-            allowedMentions: NO_MENTIONS,
-          })
-          .catch(() => {});
-      }
+      await interaction.deferReply();
+      await interaction.editReply(await userPanelPayload(interaction.guild, user.id));
     },
   },
 
@@ -1348,8 +1401,8 @@ client.on(Events.GuildMemberRemove, (member) => {
   handleLeave(member).catch((err) => console.error('guildMemberRemove error:', err));
 });
 
-// Owner-only access control for commands. The public rewards Claim button and menu
-// are handled first because every member needs to be able to use them.
+// Access control: everything is owner-only except /invites and the public rewards
+// Claim button, menu and popups (handled first because every member needs them).
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.inGuild()) {
@@ -1371,17 +1424,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    if (interaction.user.id !== OWNER_ID) {
+    const command = interaction.isChatInputCommand() ? commandMap.get(interaction.commandName) : null;
+
+    if (interaction.user.id !== OWNER_ID && !command?.public) {
       if (interaction.isRepliable()) {
-        await safeReply(interaction, {
-          embeds: [embed(null, "You don't have permission to use this command.")],
-          flags: MessageFlags.Ephemeral,
-        });
+        await safeReply(interaction, errorReply("You don't have permission to use this command."));
       }
       return;
     }
 
-    // Buttons are handled by the collector inside /resetinvites.
+    // Buttons and popups from the /user panel (owner only, checked above).
+    if (
+      interaction.inGuild() &&
+      (interaction.isButton() || interaction.isModalSubmit()) &&
+      interaction.customId.startsWith(USER_PREFIX)
+    ) {
+      await handleUserPanel(interaction);
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     // Servers only.
@@ -1393,7 +1454,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    const command = commandMap.get(interaction.commandName);
     if (command) await command.execute(interaction);
   } catch (err) {
     // A failing command must never crash the bot.
