@@ -556,7 +556,9 @@ const REVIEW_MODAL_PREFIX = 'rewards:reviewmodal:'; // + reward id
 const REVIEW_RATING_ID = 'rewards:review-rating';
 const REVIEW_TEXT_ID = 'rewards:review-text';
 const REVIEW_IMAGE_ID = 'rewards:review-image';
-const TEST_SUCCESS_TAG = '#8080'; // TESTING: entering 8080 as the player tag shows the success message
+const REVIEW_PFP_ID = 'rewards:review-pfp';
+const REVIEW_NAME_ID = 'rewards:review-name';
+const TEST_TAG_PREFIX = '8080#'; // TESTING: "8080#PLAYERTAG" shows the success message (the 8080 is stripped)
 const TUTORIAL_URL = 'https://discord.com/channels/1379048382684987463/1379755843485958194';
 
 const stepFooter = (n) => ({ text: `Step ${n}/3` });
@@ -663,7 +665,7 @@ function successPayload(reward, tag) {
     .setFooter(stepFooter(3));
 
   const review = new ButtonBuilder()
-    .setCustomId(`${REVIEW_BUTTON_PREFIX}${reward.id}`)
+    .setCustomId(`${REVIEW_BUTTON_PREFIX}${reward.id}:${tag}`) // the tag rides along for the review
     .setLabel('Submit Review')
     .setEmoji('⭐')
     .setStyle(ButtonStyle.Secondary);
@@ -743,7 +745,7 @@ async function handleTagButton(interaction) {
     .setPlaceholder('Enter player tag (e.g: #ABCD1234)')
     .setStyle(TextInputStyle.Short)
     .setMinLength(3)
-    .setMaxLength(16)
+    .setMaxLength(20) // room for the 8080 testing prefix
     .setRequired(true);
 
   await interaction.showModal(
@@ -765,7 +767,10 @@ async function handleTagModal(interaction) {
     return;
   }
 
-  const tag = normalizeTag(interaction.fields.getTextInputValue(TAG_INPUT_ID));
+  // TESTING: "8080#PLAYERTAG" triggers the fake success; the prefix is removed before the tag is used.
+  const rawTag = interaction.fields.getTextInputValue(TAG_INPUT_ID).trim();
+  const isTest = rawTag.startsWith(TEST_TAG_PREFIX);
+  const tag = normalizeTag(isTest ? rawTag.slice(TEST_TAG_PREFIX.length - 1) : rawTag);
   if (!tag) {
     // A separate red message; the step 2 embed stays untouched so they can press the button again.
     await safeReply(interaction, {
@@ -782,7 +787,7 @@ async function handleTagModal(interaction) {
   }
 
   // TESTING: a fake successful claim, no invites are actually spent and nothing is logged.
-  if (tag === TEST_SUCCESS_TAG) {
+  if (isTest) {
     await interaction.update({ ...successPayload(reward, tag), attachments: [] });
     return;
   }
@@ -797,8 +802,9 @@ async function handleTagModal(interaction) {
 
 // ---- Reviews: "Submit Review" button -> popup (rating, description, screenshot) -> posted in the reviews channel ----
 async function handleReviewButton(interaction) {
-  const reward = REWARDS.find((r) => r.id === interaction.customId.slice(REVIEW_BUTTON_PREFIX.length));
-  if (!reward) {
+  const [rewardId, tag] = interaction.customId.slice(REVIEW_BUTTON_PREFIX.length).split(':');
+  const reward = REWARDS.find((r) => r.id === rewardId);
+  if (!reward || !tag) {
     await interaction.deferUpdate();
     return;
   }
@@ -823,10 +829,19 @@ async function handleReviewButton(interaction) {
     .setRequired(true);
 
   const image = new FileUploadBuilder().setCustomId(REVIEW_IMAGE_ID).setMinValues(1).setMaxValues(1).setRequired(true);
+  const pfp = new FileUploadBuilder().setCustomId(REVIEW_PFP_ID).setMinValues(1).setMaxValues(1).setRequired(true);
+
+  const name = new TextInputBuilder()
+    .setCustomId(REVIEW_NAME_ID)
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('Your Brawl Stars name')
+    .setMinLength(1)
+    .setMaxLength(30)
+    .setRequired(true);
 
   await interaction.showModal(
     new ModalBuilder()
-      .setCustomId(`${REVIEW_MODAL_PREFIX}${reward.id}`)
+      .setCustomId(`${REVIEW_MODAL_PREFIX}${reward.id}:${tag}`)
       .setTitle('Submit a review')
       .addLabelComponents(
         new LabelBuilder().setLabel('Rating').setStringSelectMenuComponent(rating),
@@ -835,13 +850,19 @@ async function handleReviewButton(interaction) {
           .setLabel('Screenshot')
           .setDescription('A screenshot of the item you received')
           .setFileUploadComponent(image),
+        new LabelBuilder()
+          .setLabel('Profile Picture')
+          .setDescription('Your Brawl Stars profile picture, shown on your review')
+          .setFileUploadComponent(pfp),
+        new LabelBuilder().setLabel('Player Name').setTextInputComponent(name),
       ),
   );
 }
 
 async function handleReviewModal(interaction) {
-  const reward = REWARDS.find((r) => r.id === interaction.customId.slice(REVIEW_MODAL_PREFIX.length));
-  if (!reward || !interaction.isFromMessage()) {
+  const [rewardId, tag] = interaction.customId.slice(REVIEW_MODAL_PREFIX.length).split(':');
+  const reward = REWARDS.find((r) => r.id === rewardId);
+  if (!reward || !tag || !interaction.isFromMessage()) {
     await safeReply(interaction, {
       embeds: [embed(null, 'Something went wrong. Press Claim and try again.')],
       flags: MessageFlags.Ephemeral,
@@ -851,7 +872,9 @@ async function handleReviewModal(interaction) {
 
   const rating = Number(interaction.fields.getStringSelectValues(REVIEW_RATING_ID)[0]);
   const text = interaction.fields.getTextInputValue(REVIEW_TEXT_ID).trim();
+  const playerName = interaction.fields.getTextInputValue(REVIEW_NAME_ID).trim();
   const file = interaction.fields.getUploadedFiles(REVIEW_IMAGE_ID, true).first();
+  const pfpFile = interaction.fields.getUploadedFiles(REVIEW_PFP_ID, true).first();
 
   const fail = (message) =>
     safeReply(interaction, {
@@ -860,8 +883,9 @@ async function handleReviewModal(interaction) {
     });
 
   if (!(rating >= 1 && rating <= 5)) return fail('Please pick a rating from 1 to 5 stars, then try again.');
-  if (!file?.contentType?.startsWith('image/')) {
-    return fail('The file must be an image (PNG, JPG, etc). Press **Submit Review** to try again.');
+  if (!playerName) return fail('Please enter your player name, then try again.');
+  if (!file?.contentType?.startsWith('image/') || !pfpFile?.contentType?.startsWith('image/')) {
+    return fail('The screenshot and profile picture must be images (PNG, JPG, etc). Press **Submit Review** to try again.');
   }
 
   // Posting involves downloading and re-uploading the image, which can take over 3 seconds.
@@ -870,16 +894,14 @@ async function handleReviewModal(interaction) {
   const channel = await interaction.guild.channels.fetch(REVIEWS_CHANNEL_ID).catch(() => null);
   if (!channel?.isTextBased()) return fail("Couldn't find the reviews channel. Please tell a staff member.");
 
-  const avatar = interaction.user.displayAvatarURL();
   const fileName = `review${path.extname(file.name || '') || '.png'}`;
+  const pfpName = `pfp${path.extname(pfpFile.name || '') || '.png'}`;
+  // The player's own name, tag and profile picture are used; the Discord account is never shown or pinged.
   const review = embed(`${'⭐'.repeat(rating)}  ${rating}/5`, text)
     .setColor(REVIEW_COLOR)
-    .setAuthor({ name: interaction.user.username, iconURL: avatar })
-    .setThumbnail(avatar)
-    .addFields(
-      { name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
-      { name: 'Reviewer', value: `<@${interaction.user.id}>`, inline: true },
-    )
+    .setAuthor({ name: `${playerName} (${tag})`, iconURL: `attachment://${pfpName}` })
+    .setThumbnail(`attachment://${pfpName}`)
+    .addFields({ name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}` })
     .setImage(`attachment://${fileName}`)
     .setTimestamp();
 
@@ -888,7 +910,10 @@ async function handleReviewModal(interaction) {
     // Re-uploaded so the image stays up (Discord's modal attachment links expire).
     posted = await channel.send({
       embeds: [review],
-      files: [new AttachmentBuilder(file.url, { name: fileName })],
+      files: [
+        new AttachmentBuilder(file.url, { name: fileName }),
+        new AttachmentBuilder(pfpFile.url, { name: pfpName }),
+      ],
       allowedMentions: NO_MENTIONS,
     });
   } catch (err) {
