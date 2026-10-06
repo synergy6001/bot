@@ -48,6 +48,9 @@ const SUCCESS_COLOR = 0x57f287; // green, used for the claim successful embed
 const REVIEW_COLOR = 0xfee75c; // gold, used for posted reviews
 const NO_MENTIONS = { parse: [] }; // nothing the bot sends can ping anyone
 const DELETED_TTL_MS = 15_000;
+// TESTING: the automatic invite message and the Claim button's step 1 never show more than this many
+// invites. Tracking is unaffected and the commands show the real number. Set to Infinity to remove.
+const TEST_DISPLAY_INVITE_CAP = 2;
 const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 // ===========================================================================
@@ -498,7 +501,7 @@ async function sendJoinMessage(member, detected) {
   if (detected.source === 'vanity') {
     text = `${inviteeName} joined via the vanity URL.`;
   } else if (detected.inviterId) {
-    const count = getStats(member.guild.id, detected.inviterId).current;
+    const count = Math.min(getStats(member.guild.id, detected.inviterId).current, TEST_DISPLAY_INVITE_CAP);
     text = inviteText(await nameOf(member.guild, detected.inviterId), inviteeName, count);
   } else {
     text = `${inviteeName} joined (inviter unknown).`;
@@ -572,7 +575,7 @@ function progressBar(current, total, length = 10) {
 
 /** Step 1/3: the private claim menu. The user's current invite total is shown at the top. */
 function claimPayload(guildId, userId) {
-  const { current } = getStats(guildId, userId);
+  const current = Math.min(getStats(guildId, userId).current, TEST_DISPLAY_INVITE_CAP);
   const top = `You currently have **${current}** ${current === 1 ? 'invite' : 'invites'}.`;
 
   const menu = new StringSelectMenuBuilder()
@@ -899,9 +902,12 @@ async function handleReviewModal(interaction) {
   // The player's own name, tag and profile picture are used; the Discord account is never shown or pinged.
   const review = embed(`${'⭐'.repeat(rating)}  ${rating}/5`, text)
     .setColor(REVIEW_COLOR)
-    .setAuthor({ name: `${playerName} (${tag})`, iconURL: `attachment://${pfpName}` })
+    .setAuthor({ name: `${playerName} left a new review!`, iconURL: `attachment://${pfpName}` })
     .setThumbnail(`attachment://${pfpName}`)
-    .addFields({ name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}` })
+    .addFields(
+      { name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
+      { name: 'Reviewer', value: `${escapeMarkdown(playerName)} [${tag}]`, inline: true },
+    )
     .setImage(`attachment://${fileName}`)
     .setTimestamp();
 
