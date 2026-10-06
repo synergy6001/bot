@@ -42,6 +42,7 @@ if (!DISCORD_TOKEN || !OWNER_ID) {
 }
 
 const COLOR = 0x0056cd; // one consistent embed color
+const ERROR_COLOR = 0xed4245; // red, used for error embeds
 const NO_MENTIONS = { parse: [] }; // nothing the bot sends can ping anyone
 const DELETED_TTL_MS = 15_000;
 const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
@@ -564,11 +565,10 @@ function claimPayload(guildId, userId) {
 }
 
 /** Step 2/3: ask for the player tag. Typing happens in a popup form (no message content intent needed). */
-function tagPayload(reward, notice) {
+function tagPayload(reward) {
   const e = embed(
-    '📥 Claim a reward',
-    `${notice ? `${notice}\n\n` : ''}Selected: ${emojiText(reward.emoji)} **${reward.name}**\n\n` +
-      'Press the button below and enter your Brawl Stars **player tag**, this is where your reward will be sent.\n\n' +
+    `Selected: ${reward.name}`,
+    'Press the button below and enter your Brawl Stars **player tag**, this is where your reward will be sent.\n\n' +
       '**Example:**',
   ).setFooter(stepFooter(2));
 
@@ -628,10 +628,16 @@ function resultPayload(reward, have) {
   };
 }
 
-/** Accepts "#2pp", "2PP", "#2pO" etc. Brawl Stars tags only use 0289PYLQGRJCUV. */
+/**
+ * Accepts English letters and numbers in any case, with or without a leading "#"
+ * ("#20FJGIV9R3", "fj3igorb"). Returns it as "#UPPERCASE", or null if it contains spaces,
+ * emojis, symbols or non-English letters. The check runs before uppercasing so characters
+ * like "ß" can't turn into plain letters.
+ */
 function normalizeTag(raw) {
-  const tag = raw.trim().toUpperCase().replace(/^#/, '').replace(/O/g, '0');
-  return /^[0289PYLQGRJCUV]{3,15}$/.test(tag) ? `#${tag}` : null;
+  const text = raw.trim();
+  if (!/^#?[A-Za-z0-9]{3,15}$/.test(text)) return null;
+  return `#${text.replace(/^#/, '').toUpperCase()}`;
 }
 
 /** Posts one log embed per claim attempt (success or failure). Never throws. */
@@ -691,7 +697,7 @@ async function handleTagButton(interaction) {
   const input = new TextInputBuilder()
     .setCustomId(TAG_INPUT_ID)
     .setLabel('Your Brawl Stars player tag')
-    .setPlaceholder('#2PP')
+    .setPlaceholder('Enter player tag (e.g: #ABCD1234)')
     .setStyle(TextInputStyle.Short)
     .setMinLength(3)
     .setMaxLength(16)
@@ -718,9 +724,16 @@ async function handleTagModal(interaction) {
 
   const tag = normalizeTag(interaction.fields.getTextInputValue(TAG_INPUT_ID));
   if (!tag) {
-    await interaction.update({
-      ...tagPayload(reward, "❌ That doesn't look like a valid player tag. Check it and try again."),
-      attachments: [],
+    // A separate red message; the step 2 embed stays untouched so they can press the button again.
+    await safeReply(interaction, {
+      embeds: [
+        embed(
+          'Invalid player tag',
+          "That doesn't look like a valid player tag. Use only English letters and numbers, " +
+            'with no spaces or emojis, then press **Enter player tag** to try again.',
+        ).setColor(ERROR_COLOR),
+      ],
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
