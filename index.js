@@ -48,8 +48,9 @@ const SUCCESS_COLOR = 0x57f287; // green, used for the claim successful embed
 const REVIEW_COLOR = 0xfee75c; // gold, used for posted reviews
 const NO_MENTIONS = { parse: [] }; // nothing the bot sends can ping anyone
 const DELETED_TTL_MS = 15_000;
-// TESTING: the automatic invite message and the Claim button's step 1 never show more than this many
-// invites. Tracking is unaffected and the commands show the real number. Set to Infinity to remove.
+// TESTING: the Claim button's step 1 never shows more than this many invites, and the automatic invite
+// message stops being sent once an inviter's real total goes above it. Tracking is unaffected and the
+// commands show the real number. Set to Infinity to remove.
 const TEST_DISPLAY_INVITE_CAP = 2;
 const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
@@ -501,7 +502,9 @@ async function sendJoinMessage(member, detected) {
   if (detected.source === 'vanity') {
     text = `${inviteeName} joined via the vanity URL.`;
   } else if (detected.inviterId) {
-    const count = Math.min(getStats(member.guild.id, detected.inviterId).current, TEST_DISPLAY_INVITE_CAP);
+    // Tracking already happened in handleJoin; past the cap we just don't announce it.
+    const count = getStats(member.guild.id, detected.inviterId).current;
+    if (count > TEST_DISPLAY_INVITE_CAP) return;
     text = inviteText(await nameOf(member.guild, detected.inviterId), inviteeName, count);
   } else {
     text = `${inviteeName} joined (inviter unknown).`;
@@ -566,11 +569,10 @@ const TUTORIAL_URL = 'https://discord.com/channels/1379048382684987463/137975584
 
 const stepFooter = (n) => ({ text: `Step ${n}/3` });
 
-/** Text progress bar, e.g. ▰▰▰▱▱▱▱▱▱▱. Only completely full once the goal is reached. */
-function progressBar(current, total, length = 10) {
-  const ratio = Math.max(0, current) / total;
-  const filled = ratio >= 1 ? length : Math.floor(ratio * length);
-  return '▰'.repeat(filled) + '▱'.repeat(length - filled);
+/** Text progress bar with one symbol per required invite, e.g. 2/6 -> ▰▰▱▱▱▱. */
+function progressBar(current, total) {
+  const filled = Math.min(Math.max(0, Math.floor(current)), total);
+  return '▰'.repeat(filled) + '▱'.repeat(total - filled);
 }
 
 /** Step 1/3: the private claim menu. The user's current invite total is shown at the top. */
@@ -1453,7 +1455,7 @@ const commands = [
     },
   },
 
-  // /placeholder  (private panel: inviter progress, Update, Turn on/off)
+  // /placeholder  (public panel: inviter progress, Update, Turn on/off)
   {
     data: new SlashCommandBuilder()
       .setName('placeholder')
@@ -1461,10 +1463,7 @@ const commands = [
       .setContexts(InteractionContextType.Guild),
 
     async execute(interaction) {
-      await safeReply(interaction, {
-        ...placeholderPanel(interaction.guild.id),
-        flags: MessageFlags.Ephemeral,
-      });
+      await safeReply(interaction, placeholderPanel(interaction.guild.id));
     },
   },
 
