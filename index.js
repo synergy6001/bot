@@ -490,7 +490,7 @@ async function nameOf(guild, userId) {
 
 /** The invite announcement. Shared by real joins and /test. Names only, no pings. */
 function inviteText(inviterName, inviteeName, count) {
-  return `${inviterName} invited ${inviteeName} to the server.\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}! ⭐`;
+  return `**${inviterName}** invited **${inviteeName}** to the server.\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}! 👤`;
 }
 
 async function sendJoinMessage(member, detected) {
@@ -500,14 +500,14 @@ async function sendJoinMessage(member, detected) {
   const inviteeName = escapeMarkdown(member.displayName);
   let text;
   if (detected.source === 'vanity') {
-    text = `${inviteeName} joined via the vanity URL.`;
+    text = `**${inviteeName}** joined via the vanity URL.`;
   } else if (detected.inviterId) {
     // Tracking already happened in handleJoin; past the cap we just don't announce it.
     const count = getStats(member.guild.id, detected.inviterId).current;
     if (count > TEST_DISPLAY_INVITE_CAP) return;
     text = inviteText(await nameOf(member.guild, detected.inviterId), inviteeName, count);
   } else {
-    text = `${inviteeName} joined (inviter unknown).`;
+    text = `**${inviteeName}** joined (inviter unknown).`;
   }
 
   try {
@@ -1295,7 +1295,78 @@ async function handlePlaceholderButton(interaction) {
   await interaction.editReply(placeholderPanel(guild.id, notice));
 }
 
+// ---------------------------------------------------------------------------
+// /say: owner-only. Shows a private preview with Confirm / Cancel; confirming posts the
+// text as a normal message in the channel (not as a reply to the command).
+// The preview message itself holds the text, so no state is kept in memory.
+// customIds: say:confirm:<channelId> and say:cancel
+// ---------------------------------------------------------------------------
+const SAY_PREFIX = 'say:';
+
+function sayPreviewPayload(text, channelId) {
+  return {
+    content: text,
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`${SAY_PREFIX}confirm:${channelId}`).setLabel('Confirm').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`${SAY_PREFIX}cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+    allowedMentions: NO_MENTIONS,
+    flags: MessageFlags.Ephemeral,
+  };
+}
+
+async function handleSayButton(interaction) {
+  const [, action, channelId] = interaction.customId.split(':');
+
+  if (action === 'cancel') {
+    await interaction.update({ content: null, embeds: [embed(null, 'Cancelled.')], components: [] });
+    return;
+  }
+
+  // The preview message's content is exactly what gets posted.
+  const text = interaction.message.content;
+  try {
+    const channel = await interaction.client.channels.fetch(channelId);
+    // Unlike the rest of the bot, /say may ping: @everyone, @here, roles and users all work.
+    await channel.send({ content: text, allowedMentions: { parse: ['everyone', 'roles', 'users'] } });
+  } catch (err) {
+    await interaction.update({
+      content: null,
+      embeds: [embed(null, `Couldn't send the message: ${err.message}`)],
+      components: [],
+    });
+    return;
+  }
+  await interaction.update({ content: null, embeds: [embed(null, `Message sent to <#${channelId}>.`)], components: [] });
+}
+
 const commands = [
+  // /say message:<text>  (owner only)
+  {
+    data: new SlashCommandBuilder()
+      .setName('say')
+      .setDescription('Make the bot send a message in this channel (preview first)')
+      .addStringOption((o) =>
+        o
+          .setName('message')
+          .setDescription('What the bot should say (type \\n for a new line)')
+          .setRequired(true)
+          .setMaxLength(2000),
+      )
+      .setContexts(InteractionContextType.Guild),
+
+    async execute(interaction) {
+      const text = interaction.options.getString('message', true).replace(/\\n/g, '\n').trim();
+      if (!text) {
+        await send(interaction, embed(null, 'The message is empty.'), { ephemeral: true });
+        return;
+      }
+      await safeReply(interaction, sayPreviewPayload(text, interaction.channelId));
+    },
+  },
+
   // /set type:<Invite tracking | Claim logs> channel:<text channel>
   {
     data: new SlashCommandBuilder()
@@ -1866,6 +1937,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId.startsWith(USER_PREFIX)
     ) {
       await handleUserPanel(interaction);
+      return;
+    }
+
+    // /say preview buttons (owner only, checked above).
+    if (interaction.inGuild() && interaction.isButton() && interaction.customId.startsWith(SAY_PREFIX)) {
+      await handleSayButton(interaction);
       return;
     }
 
