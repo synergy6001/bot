@@ -16,7 +16,9 @@ const {
   escapeMarkdown,
   Events,
   GatewayIntentBits,
+  FileUploadBuilder,
   InteractionContextType,
+  LabelBuilder,
   MessageFlags,
   ModalBuilder,
   Options,
@@ -42,6 +44,8 @@ if (!DISCORD_TOKEN || !OWNER_ID) {
 
 const COLOR = 0x0056cd; // one consistent embed color
 const ERROR_COLOR = 0xed4245; // red, used for error embeds
+const SUCCESS_COLOR = 0x57f287; // green, used for the claim successful embed
+const REVIEW_COLOR = 0xfee75c; // gold, used for posted reviews
 const NO_MENTIONS = { parse: [] }; // nothing the bot sends can ping anyone
 const DELETED_TTL_MS = 15_000;
 const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
@@ -546,6 +550,13 @@ const emojiText = (e) => `<:${e.name}:${e.id}>`;
 const TAG_BUTTON_PREFIX = 'rewards:tag:'; // + reward id
 const TAG_MODAL_PREFIX = 'rewards:modal:'; // + reward id
 const TAG_INPUT_ID = 'rewards:tag-input';
+const REVIEWS_CHANNEL_ID = REVIEWS_URL.split('/').pop(); // reviews are posted in the channel REVIEWS_URL points to
+const REVIEW_BUTTON_PREFIX = 'rewards:review:'; // + reward id
+const REVIEW_MODAL_PREFIX = 'rewards:reviewmodal:'; // + reward id
+const REVIEW_RATING_ID = 'rewards:review-rating';
+const REVIEW_TEXT_ID = 'rewards:review-text';
+const REVIEW_IMAGE_ID = 'rewards:review-image';
+const TEST_SUCCESS_TAG = '#8080'; // TESTING: entering 8080 as the player tag shows the success message
 const TUTORIAL_URL = 'https://discord.com/channels/1379048382684987463/1379755843485958194';
 
 const stepFooter = (n) => ({ text: `Step ${n}/3` });
@@ -614,21 +625,12 @@ function tagPayload(reward) {
   };
 }
 
-/** Step 3/3: eligibility result. For now claiming isn't built, so only the "not enough" view is real. */
+/**
+ * Step 3/3: for now always the "not enough invites" view (testing). The bar never reaches
+ * the goal: with enough invites it shows one below it (e.g. 8/9 instead of 10/9).
+ */
 function resultPayload(reward, have) {
-  if (have >= reward.invites) {
-    // TODO: real claiming (staff request / delivery) goes here.
-    return {
-      embeds: [
-        embed(
-          '✅ You have enough invites',
-          `You have enough invites for ${emojiText(reward.emoji)} **${reward.name}**, but claiming isn't available yet.`,
-        ).setFooter(stepFooter(3)),
-      ],
-      components: [],
-      allowedMentions: NO_MENTIONS,
-    };
-  }
+  have = Math.min(have, reward.invites - 1);
 
   const missing = reward.invites - have;
   const e = embed(
@@ -645,6 +647,28 @@ function resultPayload(reward, have) {
     components: [new ActionRowBuilder().addComponents(tutorial)],
     allowedMentions: NO_MENTIONS,
   };
+}
+
+/** Step 3/3: TESTING success message (shown when the player tag is 8080). Nothing is deducted. */
+function successPayload(reward, tag) {
+  const e = embed(
+    '✅ Claim successful!',
+    `You claimed ${emojiText(reward.emoji)} **${reward.name}**.\n\n` +
+      `**Player tag:** \`${tag}\`\n` +
+      `**Invites spent:** ${reward.invites}\n\n` +
+      'You should receive your reward in-game within ~10 minutes.\n\n' +
+      '📸 Once you receive it, take a screenshot of the item and leave a review using the button below.',
+  )
+    .setColor(SUCCESS_COLOR)
+    .setFooter(stepFooter(3));
+
+  const review = new ButtonBuilder()
+    .setCustomId(`${REVIEW_BUTTON_PREFIX}${reward.id}`)
+    .setLabel('Submit Review')
+    .setEmoji('⭐')
+    .setStyle(ButtonStyle.Secondary);
+
+  return { embeds: [e], components: [new ActionRowBuilder().addComponents(review)], allowedMentions: NO_MENTIONS };
 }
 
 /**
@@ -757,12 +781,128 @@ async function handleTagModal(interaction) {
     return;
   }
 
+  // TESTING: a fake successful claim, no invites are actually spent and nothing is logged.
+  if (tag === TEST_SUCCESS_TAG) {
+    await interaction.update({ ...successPayload(reward, tag), attachments: [] });
+    return;
+  }
+
   const have = Math.max(0, getStats(interaction.guildId, interaction.user.id).current);
   const success = have >= reward.invites;
 
   // TODO: once claiming exists, pass `tag` along to the staff request.
   await interaction.update({ ...resultPayload(reward, have), attachments: [] });
   await logClaimAttempt(interaction, { reward, tag, have, success });
+}
+
+// ---- Reviews: "Submit Review" button -> popup (rating, description, screenshot) -> posted in the reviews channel ----
+async function handleReviewButton(interaction) {
+  const reward = REWARDS.find((r) => r.id === interaction.customId.slice(REVIEW_BUTTON_PREFIX.length));
+  if (!reward) {
+    await interaction.deferUpdate();
+    return;
+  }
+
+  const rating = new StringSelectMenuBuilder()
+    .setCustomId(REVIEW_RATING_ID)
+    .setPlaceholder('Select a rating')
+    .addOptions(
+      [5, 4, 3, 2, 1].map((n) => ({
+        label: `${n} ${n === 1 ? 'star' : 'stars'}`,
+        description: '⭐'.repeat(n),
+        value: String(n),
+      })),
+    );
+
+  const text = new TextInputBuilder()
+    .setCustomId(REVIEW_TEXT_ID)
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('Tell us about your experience')
+    .setMinLength(10)
+    .setMaxLength(1000)
+    .setRequired(true);
+
+  const image = new FileUploadBuilder().setCustomId(REVIEW_IMAGE_ID).setMinValues(1).setMaxValues(1).setRequired(true);
+
+  await interaction.showModal(
+    new ModalBuilder()
+      .setCustomId(`${REVIEW_MODAL_PREFIX}${reward.id}`)
+      .setTitle('Submit a review')
+      .addLabelComponents(
+        new LabelBuilder().setLabel('Rating').setStringSelectMenuComponent(rating),
+        new LabelBuilder().setLabel('Review').setTextInputComponent(text),
+        new LabelBuilder()
+          .setLabel('Screenshot')
+          .setDescription('A screenshot of the item you received')
+          .setFileUploadComponent(image),
+      ),
+  );
+}
+
+async function handleReviewModal(interaction) {
+  const reward = REWARDS.find((r) => r.id === interaction.customId.slice(REVIEW_MODAL_PREFIX.length));
+  if (!reward || !interaction.isFromMessage()) {
+    await safeReply(interaction, {
+      embeds: [embed(null, 'Something went wrong. Press Claim and try again.')],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const rating = Number(interaction.fields.getStringSelectValues(REVIEW_RATING_ID)[0]);
+  const text = interaction.fields.getTextInputValue(REVIEW_TEXT_ID).trim();
+  const file = interaction.fields.getUploadedFiles(REVIEW_IMAGE_ID, true).first();
+
+  const fail = (message) =>
+    safeReply(interaction, {
+      embeds: [embed('Review not posted', message).setColor(ERROR_COLOR)],
+      flags: MessageFlags.Ephemeral,
+    });
+
+  if (!(rating >= 1 && rating <= 5)) return fail('Please pick a rating from 1 to 5 stars, then try again.');
+  if (!file?.contentType?.startsWith('image/')) {
+    return fail('The file must be an image (PNG, JPG, etc). Press **Submit Review** to try again.');
+  }
+
+  // Posting involves downloading and re-uploading the image, which can take over 3 seconds.
+  await interaction.deferUpdate();
+
+  const channel = await interaction.guild.channels.fetch(REVIEWS_CHANNEL_ID).catch(() => null);
+  if (!channel?.isTextBased()) return fail("Couldn't find the reviews channel. Please tell a staff member.");
+
+  const avatar = interaction.user.displayAvatarURL();
+  const fileName = `review${path.extname(file.name || '') || '.png'}`;
+  const review = embed(`${'⭐'.repeat(rating)}  ${rating}/5`, text)
+    .setColor(REVIEW_COLOR)
+    .setAuthor({ name: interaction.user.username, iconURL: avatar })
+    .setThumbnail(avatar)
+    .addFields(
+      { name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
+      { name: 'Reviewer', value: `<@${interaction.user.id}>`, inline: true },
+    )
+    .setImage(`attachment://${fileName}`)
+    .setTimestamp();
+
+  let posted;
+  try {
+    // Re-uploaded so the image stays up (Discord's modal attachment links expire).
+    posted = await channel.send({
+      embeds: [review],
+      files: [new AttachmentBuilder(file.url, { name: fileName })],
+      allowedMentions: NO_MENTIONS,
+    });
+  } catch (err) {
+    console.warn(`[${interaction.guild?.name}] Could not post review:`, err.message);
+    return fail(`Couldn't post your review: ${err.message}`);
+  }
+
+  // Replace step 3 with a thank-you so the same claim can't be reviewed twice.
+  const view = new ButtonBuilder().setLabel('View your review').setEmoji('⭐').setStyle(ButtonStyle.Link).setURL(posted.url);
+  await interaction.editReply({
+    embeds: [embed('Thank you for your review!', 'Your review has been posted.').setColor(SUCCESS_COLOR)],
+    components: [new ActionRowBuilder().addComponents(view)],
+    attachments: [],
+  });
 }
 
 // ---- /user panel: member info plus owner-only Add / Remove / Reset buttons ----
@@ -1420,6 +1560,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.isModalSubmit() && interaction.customId.startsWith(TAG_MODAL_PREFIX)) {
         await handleTagModal(interaction);
+        return;
+      }
+      if (interaction.isButton() && interaction.customId.startsWith(REVIEW_BUTTON_PREFIX)) {
+        await handleReviewButton(interaction);
+        return;
+      }
+      if (interaction.isModalSubmit() && interaction.customId.startsWith(REVIEW_MODAL_PREFIX)) {
+        await handleReviewModal(interaction);
         return;
       }
     }
