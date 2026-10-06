@@ -19,12 +19,15 @@ const {
   GatewayIntentBits,
   InteractionContextType,
   MessageFlags,
+  ModalBuilder,
   Options,
   PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 
 // ===========================================================================
@@ -59,8 +62,9 @@ db.pragma('cache_size = -2000'); // ~2 MB page cache keeps memory low
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS guild_settings (
-    guild_id   TEXT PRIMARY KEY,
-    channel_id TEXT
+    guild_id       TEXT PRIMARY KEY,
+    channel_id     TEXT,
+    log_channel_id TEXT
   );
   CREATE TABLE IF NOT EXISTS joins (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,12 +88,23 @@ db.exec(`
   );
 `);
 
+// Databases created before claim logging existed don't have the column yet.
+if (!db.prepare('PRAGMA table_info(guild_settings)').all().some((c) => c.name === 'log_channel_id')) {
+  db.exec('ALTER TABLE guild_settings ADD COLUMN log_channel_id TEXT');
+}
+
 const q = {
-  getChannel: db.prepare('SELECT channel_id FROM guild_settings WHERE guild_id = ?'),
+  getChannel: db.prepare('SELECT channel_id, log_channel_id FROM guild_settings WHERE guild_id = ?'),
   setChannel: db.prepare(`
     INSERT INTO guild_settings (guild_id, channel_id) VALUES (?, ?)
     ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id`),
-  clearChannel: db.prepare('DELETE FROM guild_settings WHERE guild_id = ?'),
+  setLogChannel: db.prepare(`
+    INSERT INTO guild_settings (guild_id, log_channel_id) VALUES (?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET log_channel_id = excluded.log_channel_id`),
+  clearChannel: db.prepare(
+    'UPDATE guild_settings SET channel_id = NULL WHERE guild_id = ? AND channel_id IS NOT NULL'),
+  clearLogChannel: db.prepare(
+    'UPDATE guild_settings SET log_channel_id = NULL WHERE guild_id = ? AND log_channel_id IS NOT NULL'),
   activeJoin: db.prepare(`
     SELECT * FROM joins WHERE guild_id = ? AND member_id = ? AND left_at IS NULL
     ORDER BY id DESC LIMIT 1`),
@@ -125,6 +140,19 @@ function setChannelId(guildId, channelId) {
 /** Returns true if a tracking channel was actually removed. */
 function clearChannelId(guildId) {
   return q.clearChannel.run(guildId).changes > 0;
+}
+
+function getLogChannelId(guildId) {
+  return q.getChannel.get(guildId)?.log_channel_id ?? null;
+}
+
+function setLogChannelId(guildId, channelId) {
+  q.setLogChannel.run(guildId, channelId);
+}
+
+/** Returns true if a log channel was actually removed. */
+function clearLogChannelId(guildId) {
+  return q.clearLogChannel.run(guildId).changes > 0;
 }
 
 /** Closes a join record and counts a leave for its inviter (if it was counted). */
@@ -271,6 +299,13 @@ function enqueue(guildId, task) {
 
 async function getTrackingChannel(guild) {
   const channelId = getChannelId(guild.id);
+  if (!channelId) return null;
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  return channel?.isTextBased() ? channel : null;
+}
+
+async function getLogChannel(guild) {
+  const channelId = getLogChannelId(guild.id);
   if (!channelId) return null;
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   return channel?.isTextBased() ? channel : null;
@@ -488,8 +523,22 @@ const REWARDS = [
 const ARROW_ICON = 'https://cdn.discordapp.com/emojis/1556702446104088646.png';
 const emojiText = (e) => `<:${e.name}:${e.id}>`;
 
-/** The private claim menu. The user's current invite total is always shown at the top. */
-function claimPayload(guildId, userId, notice) {
+const TAG_BUTTON_PREFIX = 'rewards:tag:'; // + reward id
+const TAG_MODAL_PREFIX = 'rewards:modal:'; // + reward id
+const TAG_INPUT_ID = 'rewards:tag-input';
+const TUTORIAL_URL = 'https://discord.com/channels/1379048382684987463/1379755843485958194';
+
+const stepFooter = (n) => ({ text: `Step ${n}/3` });
+
+/** Text progress bar, e.g. ▰▰▰▱▱▱▱▱▱▱. Only completely full once the goal is reached. */
+function progressBar(current, total, length = 10) {
+  const ratio = Math.max(0, current) / total;
+  const filled = ratio >= 1 ? length : Math.floor(ratio * length);
+  return '▰'.repeat(filled) + '▱'.repeat(length - filled);
+}
+
+/** Step 1/3: the private claim menu. The user's current invite total is shown at the top. */
+function claimPayload(guildId, userId) {
   const { current } = getStats(guildId, userId);
   const top = `You currently have **${current}** ${current === 1 ? 'invite' : 'invites'}.`;
 
@@ -506,10 +555,112 @@ function claimPayload(guildId, userId, notice) {
     );
 
   return {
-    embeds: [embed('📥 Claim a reward', `${top}\n\n${notice ?? 'Select the reward you want to claim below.'}`)],
+    embeds: [
+      embed('📥 Claim a reward', `${top}\n\nSelect the reward you want to claim below.`).setFooter(stepFooter(1)),
+    ],
     components: [new ActionRowBuilder().addComponents(menu)],
     allowedMentions: NO_MENTIONS,
   };
+}
+
+/** Step 2/3: ask for the player tag. Typing happens in a popup form (no message content intent needed). */
+function tagPayload(reward, notice) {
+  const e = embed(
+    '📥 Claim a reward',
+    `${notice ? `${notice}\n\n` : ''}Selected: ${emojiText(reward.emoji)} **${reward.name}**\n\n` +
+      'Press the button below and enter your Brawl Stars **player tag**, this is where your reward will be sent.\n\n' +
+      '**Example:**',
+  ).setFooter(stepFooter(2));
+
+  const files = [];
+  const examplePath = path.resolve(__dirname, 'playertag.png');
+  if (fs.existsSync(examplePath)) {
+    files.push(new AttachmentBuilder(examplePath, { name: 'playertag.png' }));
+    e.setImage('attachment://playertag.png');
+  } else {
+    console.warn(`playertag.png not found at ${examplePath}; showing step 2 without the example image.`);
+  }
+
+  const button = new ButtonBuilder()
+    .setCustomId(`${TAG_BUTTON_PREFIX}${reward.id}`)
+    .setLabel('Enter player tag')
+    .setEmoji('✏️')
+    .setStyle(ButtonStyle.Secondary);
+
+  return {
+    embeds: [e],
+    files,
+    components: [new ActionRowBuilder().addComponents(button)],
+    allowedMentions: NO_MENTIONS,
+  };
+}
+
+/** Step 3/3: eligibility result. For now claiming isn't built, so only the "not enough" view is real. */
+function resultPayload(reward, have) {
+  if (have >= reward.invites) {
+    // TODO: real claiming (staff request / delivery) goes here.
+    return {
+      embeds: [
+        embed(
+          '✅ You have enough invites',
+          `You have enough invites for ${emojiText(reward.emoji)} **${reward.name}**, but claiming isn't available yet.`,
+        ).setFooter(stepFooter(3)),
+      ],
+      components: [],
+      allowedMentions: NO_MENTIONS,
+    };
+  }
+
+  const missing = reward.invites - have;
+  const e = embed(
+    '❌ Not enough invites',
+    `You don't have enough invites to claim ${emojiText(reward.emoji)} **${reward.name}**.\n\n` +
+      `**${have}/${reward.invites}** invites\n${progressBar(have, reward.invites)}\n\n` +
+      `You need **${missing} more** ${missing === 1 ? 'invite' : 'invites'}.`,
+  ).setFooter(stepFooter(3));
+
+  const tutorial = new ButtonBuilder().setLabel('Tutorial').setEmoji('❓').setStyle(ButtonStyle.Link).setURL(TUTORIAL_URL);
+
+  return {
+    embeds: [e],
+    components: [new ActionRowBuilder().addComponents(tutorial)],
+    allowedMentions: NO_MENTIONS,
+  };
+}
+
+/** Accepts "#2pp", "2PP", "#2pO" etc. Brawl Stars tags only use 0289PYLQGRJCUV. */
+function normalizeTag(raw) {
+  const tag = raw.trim().toUpperCase().replace(/^#/, '').replace(/O/g, '0');
+  return /^[0289PYLQGRJCUV]{3,15}$/.test(tag) ? `#${tag}` : null;
+}
+
+/** Posts one log embed per claim attempt (success or failure). Never throws. */
+async function logClaimAttempt(interaction, { reward, tag, have, success }) {
+  try {
+    const channel = await getLogChannel(interaction.guild);
+    if (!channel) return;
+
+    const avatar = interaction.user.displayAvatarURL();
+    const log = embed(
+      success ? '✅ Claim succeeded' : '❌ Claim failed',
+      success
+        ? 'The member had enough invites.'
+        : `The member didn't have enough invites (${reward.invites - have} short).`,
+    )
+      .setAuthor({ name: interaction.user.username, iconURL: avatar })
+      .setThumbnail(avatar)
+      .addFields(
+        { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+        { name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
+        { name: 'Invites', value: `${have}/${reward.invites}`, inline: true },
+        { name: 'Player tag', value: `\`${tag}\``, inline: true },
+      )
+      .setTimestamp();
+
+    await channel.send({ embeds: [log], allowedMentions: NO_MENTIONS });
+  } catch (err) {
+    console.warn(`[${interaction.guild?.name}] Could not send claim log:`, err.message);
+  }
 }
 
 async function handleClaimButton(interaction) {
@@ -519,42 +670,103 @@ async function handleClaimButton(interaction) {
   });
 }
 
+// Step 1 -> 2
 async function handleClaimSelect(interaction) {
   const reward = REWARDS.find((r) => r.id === interaction.values[0]);
   if (!reward) {
     await interaction.deferUpdate();
     return;
   }
-  // Placeholder: claiming isn't built yet, so every selection says "not enough".
-  await interaction.update(
-    claimPayload(
-      interaction.guildId,
-      interaction.user.id,
-      `❌ You don't have enough invites to claim **${reward.name}**.`,
-    ),
+  await interaction.update({ ...tagPayload(reward), attachments: [] });
+}
+
+// Step 2: the button opens the player tag popup.
+async function handleTagButton(interaction) {
+  const reward = REWARDS.find((r) => r.id === interaction.customId.slice(TAG_BUTTON_PREFIX.length));
+  if (!reward) {
+    await interaction.deferUpdate();
+    return;
+  }
+
+  const input = new TextInputBuilder()
+    .setCustomId(TAG_INPUT_ID)
+    .setLabel('Your Brawl Stars player tag')
+    .setPlaceholder('#2PP')
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(3)
+    .setMaxLength(16)
+    .setRequired(true);
+
+  await interaction.showModal(
+    new ModalBuilder()
+      .setCustomId(`${TAG_MODAL_PREFIX}${reward.id}`)
+      .setTitle('Player tag')
+      .addComponents(new ActionRowBuilder().addComponents(input)),
   );
 }
 
+// Step 2 -> 3
+async function handleTagModal(interaction) {
+  const reward = REWARDS.find((r) => r.id === interaction.customId.slice(TAG_MODAL_PREFIX.length));
+  if (!reward || !interaction.isFromMessage()) {
+    await safeReply(interaction, {
+      embeds: [embed(null, 'Something went wrong. Press Claim and try again.')],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const tag = normalizeTag(interaction.fields.getTextInputValue(TAG_INPUT_ID));
+  if (!tag) {
+    await interaction.update({
+      ...tagPayload(reward, "❌ That doesn't look like a valid player tag. Check it and try again."),
+      attachments: [],
+    });
+    return;
+  }
+
+  const have = Math.max(0, getStats(interaction.guildId, interaction.user.id).current);
+  const success = have >= reward.invites;
+
+  // TODO: once claiming exists, pass `tag` along to the staff request.
+  await interaction.update({ ...resultPayload(reward, have), attachments: [] });
+  await logClaimAttempt(interaction, { reward, tag, have, success });
+}
+
 const commands = [
-  // /set channel:<text channel>
+  // /set type:<Invite tracking | Claim logs> channel:<text channel>
   {
     data: new SlashCommandBuilder()
       .setName('set')
-      .setDescription('Set the channel where join messages are posted')
+      .setDescription('Set the invite tracking channel or the claim logs channel')
+      .addStringOption((o) =>
+        o
+          .setName('type')
+          .setDescription('Which channel to set')
+          .addChoices({ name: 'Invite tracking', value: 'tracking' }, { name: 'Claim logs', value: 'logs' })
+          .setRequired(true),
+      )
       .addChannelOption((o) =>
         o
           .setName('channel')
-          .setDescription('The tracking channel')
+          .setDescription('The channel to use')
           .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
           .setRequired(true),
       )
       .setContexts(InteractionContextType.Guild),
 
     async execute(interaction) {
+      const type = interaction.options.getString('type', true);
       const channel = interaction.options.getChannel('channel', true);
-      setChannelId(interaction.guildId, channel.id);
 
-      const result = embed('Tracking channel set', `Join messages will be posted in <#${channel.id}>.`);
+      let result;
+      if (type === 'logs') {
+        setLogChannelId(interaction.guildId, channel.id);
+        result = embed('Log channel set', `Claim attempts will be logged in <#${channel.id}>.`);
+      } else {
+        setChannelId(interaction.guildId, channel.id);
+        result = embed('Tracking channel set', `Join messages will be posted in <#${channel.id}>.`);
+      }
 
       // Warn if the bot can't post there.
       const me = interaction.guild.members.me;
@@ -578,14 +790,33 @@ const commands = [
     },
   },
 
-  // /unset
+  // /unset type:<optional, defaults to invite tracking>
   {
     data: new SlashCommandBuilder()
       .setName('unset')
-      .setDescription('Remove the tracking channel')
+      .setDescription('Remove the invite tracking channel or the claim logs channel')
+      .addStringOption((o) =>
+        o
+          .setName('type')
+          .setDescription('Which channel to remove (defaults to invite tracking)')
+          .addChoices({ name: 'Invite tracking', value: 'tracking' }, { name: 'Claim logs', value: 'logs' }),
+      )
       .setContexts(InteractionContextType.Guild),
 
     async execute(interaction) {
+      const type = interaction.options.getString('type') ?? 'tracking';
+
+      if (type === 'logs') {
+        const removed = clearLogChannelId(interaction.guildId);
+        await send(
+          interaction,
+          removed
+            ? embed('Log channel removed', 'Claim attempts are no longer logged.')
+            : embed('Nothing to remove', 'No log channel was set.'),
+        );
+        return;
+      }
+
       const removed = clearChannelId(interaction.guildId);
       await send(
         interaction,
@@ -764,7 +995,7 @@ const commands = [
   {
     data: new SlashCommandBuilder()
       .setName('status')
-      .setDescription('Show tracking channel, cached invites, and permission status')
+      .setDescription('Show tracking and log channels, cached invites, and permission status')
       .setContexts(InteractionContextType.Guild),
 
     async execute(interaction) {
@@ -775,6 +1006,13 @@ const commands = [
       const channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
       let channelText = 'Not set';
       if (channelId) channelText = channel ? `<#${channel.id}>` : 'Not found (use /set again)';
+
+      const logId = getLogChannelId(guild.id);
+      let logText = 'Not set';
+      if (logId) {
+        const logChannel = await guild.channels.fetch(logId).catch(() => null);
+        logText = logChannel ? `<#${logChannel.id}>` : 'Not found (use /set again)';
+      }
 
       const cached = inviteCache.get(guild.id)?.size;
       const cachedText = cached === undefined ? 'Not loaded (needs Manage Server)' : String(cached);
@@ -794,6 +1032,7 @@ const commands = [
         embed('Bot status', allOk ? 'All required permissions are in place.' : 'Some permissions are missing.')
           .addFields(
             { name: 'Tracking channel', value: channelText, inline: true },
+            { name: 'Log channel', value: logText, inline: true },
             { name: 'Cached invites', value: cachedText, inline: true },
             {
               name: channel ? 'Permissions (in tracking channel)' : 'Permissions (server-wide)',
@@ -1107,6 +1346,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.isStringSelectMenu() && interaction.customId === CLAIM_SELECT_ID) {
         await handleClaimSelect(interaction);
+        return;
+      }
+      if (interaction.isButton() && interaction.customId.startsWith(TAG_BUTTON_PREFIX)) {
+        await handleTagButton(interaction);
+        return;
+      }
+      if (interaction.isModalSubmit() && interaction.customId.startsWith(TAG_MODAL_PREFIX)) {
+        await handleTagModal(interaction);
         return;
       }
     }
