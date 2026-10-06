@@ -943,6 +943,68 @@ const commands = [
       await send(interaction, embed(null, 'Rewards message posted.'), { ephemeral: true });
     },
   },
+
+  // /tutorial
+  {
+    data: new SlashCommandBuilder()
+      .setName('tutorial')
+      .setDescription('Post the invite tutorial embeds in this channel')
+      .setContexts(InteractionContextType.Guild),
+
+    async execute(interaction) {
+      const channel =
+        interaction.channel ?? (await interaction.guild.channels.fetch(interaction.channelId).catch(() => null));
+      if (!channel?.isTextBased()) {
+        await send(interaction, embed(null, "I can't post in this channel."), { ephemeral: true });
+        return;
+      }
+
+      const step1 = embed(
+        'Step 1:',
+        'Click on the server name and find the "Invite" button below, then click it.',
+      );
+      const step2 = embed(
+        'Step 2:',
+        'From here, you can copy the link to send it to others, or directly invite people to the server below.',
+      );
+
+      // step1.png / step2.png / logo.png are read from the same folder as index.js.
+      const files = [];
+      const attach = (fileName) => {
+        const filePath = path.resolve(__dirname, fileName);
+        if (!fs.existsSync(filePath)) {
+          console.warn(`${fileName} not found at ${filePath}; posting without it.`);
+          return false;
+        }
+        files.push(new AttachmentBuilder(filePath, { name: fileName }));
+        return true;
+      };
+
+      if (attach('step1.png')) step1.setImage('attachment://step1.png');
+      if (attach('step2.png')) step2.setImage('attachment://step2.png');
+
+      const footer = {
+        text: 'Pro tip: Join Brawl Stars related servers and say "message me for free brawl pass" and once they do, send them your invite link!',
+      };
+      if (attach('logo.png')) footer.iconURL = 'attachment://logo.png';
+      step2.setFooter(footer);
+
+      // channel.send posts a brand new message; it is not a reply to the command.
+      try {
+        await channel.send({
+          embeds: [step1, step2],
+          files,
+          allowedMentions: NO_MENTIONS,
+        });
+      } catch (err) {
+        await send(interaction, embed(null, `Couldn't post here: ${err.message}`), { ephemeral: true });
+        return;
+      }
+
+      // Slash commands must be acknowledged; keep it private so the channel only shows the embeds.
+      await send(interaction, embed(null, 'Tutorial message posted.'), { ephemeral: true });
+    },
+  },
 ];
 
 const commandMap = new Map(commands.map((c) => [c.data.name, c]));
