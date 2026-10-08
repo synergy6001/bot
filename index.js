@@ -832,12 +832,11 @@ async function handleReviewButton(interaction) {
   const text = new TextInputBuilder()
     .setCustomId(REVIEW_TEXT_ID)
     .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder('Tell us about your experience')
-    .setMinLength(10)
+    .setPlaceholder('Tell us about your experience (optional)')
     .setMaxLength(1000)
-    .setRequired(true);
+    .setRequired(false);
 
-  const image = new FileUploadBuilder().setCustomId(REVIEW_IMAGE_ID).setMinValues(1).setMaxValues(1).setRequired(true);
+  const image = new FileUploadBuilder().setCustomId(REVIEW_IMAGE_ID).setMinValues(0).setMaxValues(1).setRequired(false);
   const pfp = new FileUploadBuilder().setCustomId(REVIEW_PFP_ID).setMinValues(1).setMaxValues(1).setRequired(true);
 
   const name = new TextInputBuilder()
@@ -854,9 +853,9 @@ async function handleReviewButton(interaction) {
       .setTitle('Submit a review')
       .addLabelComponents(
         new LabelBuilder().setLabel('Rating').setStringSelectMenuComponent(rating),
-        new LabelBuilder().setLabel('Review').setTextInputComponent(text),
+        new LabelBuilder().setLabel('Review (optional)').setTextInputComponent(text),
         new LabelBuilder()
-          .setLabel('Screenshot')
+          .setLabel('Screenshot (optional)')
           .setDescription('A screenshot of the item you received')
           .setFileUploadComponent(image),
         new LabelBuilder()
@@ -882,7 +881,7 @@ async function handleReviewModal(interaction) {
   const rating = Number(interaction.fields.getStringSelectValues(REVIEW_RATING_ID)[0]);
   const text = interaction.fields.getTextInputValue(REVIEW_TEXT_ID).trim();
   const playerName = interaction.fields.getTextInputValue(REVIEW_NAME_ID).trim();
-  const file = interaction.fields.getUploadedFiles(REVIEW_IMAGE_ID, true).first();
+  const file = interaction.fields.getUploadedFiles(REVIEW_IMAGE_ID, false)?.first() ?? null; // optional
   const pfpFile = interaction.fields.getUploadedFiles(REVIEW_PFP_ID, true).first();
 
   const fail = (message) =>
@@ -893,7 +892,7 @@ async function handleReviewModal(interaction) {
 
   if (!(rating >= 1 && rating <= 5)) return fail('Please pick a rating from 1 to 5 stars, then try again.');
   if (!playerName) return fail('Please enter your player name, then try again.');
-  if (!file?.contentType?.startsWith('image/') || !pfpFile?.contentType?.startsWith('image/')) {
+  if ((file && !file.contentType?.startsWith('image/')) || !pfpFile?.contentType?.startsWith('image/')) {
     return fail('The screenshot and profile picture must be images (PNG, JPG, etc). Press **Submit Review** to try again.');
   }
 
@@ -903,7 +902,7 @@ async function handleReviewModal(interaction) {
   const channel = await interaction.guild.channels.fetch(REVIEWS_CHANNEL_ID).catch(() => null);
   if (!channel?.isTextBased()) return fail("Couldn't find the reviews channel. Please tell a staff member.");
 
-  const fileName = `review${path.extname(file.name || '') || '.png'}`;
+  const fileName = file ? `review${path.extname(file.name || '') || '.png'}` : null;
   const pfpName = `pfp${path.extname(pfpFile.name || '') || '.png'}`;
   // The player's own name, tag and profile picture are used; the Discord account is never shown or pinged.
   const review = embed(`${'⭐'.repeat(rating)}  ${rating}/5`, text)
@@ -912,10 +911,10 @@ async function handleReviewModal(interaction) {
     .setThumbnail(`attachment://${pfpName}`)
     .addFields(
       { name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
-      { name: 'Reviewer', value: `${escapeMarkdown(playerName)} [${tag}]`, inline: true },
+      { name: 'Reviewer', value: `${escapeMarkdown(playerName)} [\`${tag}\`](https://brawlify.com/stats/profile/${tag.replace(/^#/, '')})`, inline: true },
     )
-    .setImage(`attachment://${fileName}`)
     .setTimestamp();
+  if (file) review.setImage(`attachment://${fileName}`); // screenshot is optional
 
   let posted;
   try {
@@ -923,7 +922,7 @@ async function handleReviewModal(interaction) {
     posted = await channel.send({
       embeds: [review],
       files: [
-        new AttachmentBuilder(file.url, { name: fileName }),
+        ...(file ? [new AttachmentBuilder(file.url, { name: fileName })] : []),
         new AttachmentBuilder(pfpFile.url, { name: pfpName }),
       ],
       allowedMentions: NO_MENTIONS,
@@ -1658,22 +1657,23 @@ const commands = [
         .setAuthor({ name: 'Process', iconURL: ARROW_ICON })
         .addFields(
           {
-            name: '1. Start inviting people to the server',
+            name: '1. Invite people to the server',
             value:
-              'Get yourself an invite link by clicking on the server name, then "Invite". From there you can copy ' +
-              'the link to send it to others or directly send it to your friends.',
+              'Click the server name, press "Invite" and copy your invite link. Send it to your friends or ' +
+              'share it anywhere. You get an invite every time someone joins using your link.',
           },
           {
-            name: '2. Get enough invites',
+            name: '2. Claim your reward',
             value:
-              'Check your invites using the "Claim" button below, once you have enough for your desired ' +
-              'reward continue to the next step.',
+              'Press the "Claim" button below, pick your reward and enter your Brawl Stars player tag. Our bot ' +
+              'will check your total invites, and if you have enough, the item will be sent automatically to ' +
+              'the selected account. **We never ask for your login.**',
           },
           {
-            name: '3. Claim your reward',
+            name: '3. Leave a review (optional)',
             value:
-              'Press the "Claim" button below, select your reward and follow the automated process, the item ' +
-              "will be sent to you within 10 minutes and you'll be asked to leave a vouch. Enjoy!",
+              "After your item is delivered, you'll be asked to leave a review and attach a screenshot of the " +
+              "delivery. This step is optional, but we'd really appreciate it.",
           },
         );
 
@@ -1850,7 +1850,7 @@ const commands = [
         .setAccentColor(COLOR)
         .addTextDisplayComponents(
           new TextDisplayBuilder().setContent(
-            '## 🎁 Free Brawl Stars Freebies\nTap a button below to claim the item. Each link is a voucher for that reward.',
+            '## 🎁 Brawl Stars Freebies\nTap a button below to claim the item. Each link is a voucher for that reward.',
           ),
         );
 
@@ -1872,7 +1872,7 @@ const commands = [
       container
         .addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small))
         .addTextDisplayComponents(
-          new TextDisplayBuilder().setContent('-# FreePass - The only legit place to get freebies!'),
+          new TextDisplayBuilder().setContent('-# Updated as of Oct 8. Contact staff if a link is expired.'),
         );
 
       // channel.send posts a brand new message; it is not a reply to the command.
