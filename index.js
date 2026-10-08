@@ -12,6 +12,7 @@ const {
   ButtonStyle,
   ChannelType,
   Client,
+  ContainerBuilder,
   EmbedBuilder,
   escapeMarkdown,
   Events,
@@ -25,8 +26,11 @@ const {
   PermissionFlagsBits,
   REST,
   Routes,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
+  TextDisplayBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require('discord.js');
@@ -1789,6 +1793,102 @@ const commands = [
 
       // Slash commands must be acknowledged; keep it private so the channel only shows the embeds.
       await send(interaction, embed(null, 'Tutorial message posted.'), { ephemeral: true });
+    },
+  },
+
+  // /freebies
+  {
+    data: new SlashCommandBuilder()
+      .setName('freebies')
+      .setDescription('Post the Brawl Stars freebies message in this channel')
+      .setContexts(InteractionContextType.Guild),
+
+    async execute(interaction) {
+      const channel =
+        interaction.channel ?? (await interaction.guild.channels.fetch(interaction.channelId).catch(() => null));
+      if (!channel?.isTextBased()) {
+        await send(interaction, embed(null, "I can't post in this channel."), { ephemeral: true });
+        return;
+      }
+
+      const FREEBIES = [
+        {
+          title: '🪙 Resources',
+          items: [
+            ['100x Coins', 'https://link.brawlstars.com/en/voucher/6bb96c6a-bb06-4b06-aae8-4de28c39474d'],
+            ['500x Coins', 'https://link.brawlstars.com/en/voucher/24321637-3978-4f14-a258-a1a713d17213'],
+          ],
+        },
+        {
+          title: '📌 Pins',
+          items: [
+            ['Thief Pin', 'https://link.brawlstars.com/en/voucher/7bae5a2d-2afa-4e58-8f9b-dab2d987834c'],
+            ['Bulb Pin', 'https://link.brawlstars.com/en/voucher/fad039a8-4850-4a09-b1dd-f673afec5aa7'],
+            ['White Spray Pin', 'https://link.brawlstars.com/en/voucher/315b3e4f-0fd5-4a31-a5b0-86806f7638fc'],
+            ['Clown Pin', 'https://link.brawlstars.com/en/voucher/b647c71d-41a5-42c4-a10f-8d47952d82f3'],
+            ['Cartoon Skull Pin', 'https://link.brawlstars.com/en/voucher/2593e957-9cef-4ce7-b15f-b1dec74ec7df'],
+            ['Godzilla Egg Pin', 'https://link.brawlstars.com/en/voucher/cc017c48-b904-448d-9fe1-dd494e28bfd2'],
+            ['Upside Down Pin', 'https://link.brawlstars.com/en/voucher/cbd9bc12-423e-4a32-be45-590b0ebc52ad'],
+            ['Skull Mindblown Pin', 'https://link.brawlstars.com/en/voucher/e4a3bb44-95fd-48d1-9fe6-378619bf2eb9'],
+          ],
+        },
+        {
+          title: '🎨 Sprays',
+          items: [
+            ['Candle Spray', 'https://link.brawlstars.com/en/voucher/04b98c55-f411-4656-bbec-ef47b46ef1fa/'],
+            ['Subway Surfers Spray', 'https://link.brawlstars.com/en/voucher/04f69983-0712-49b3-af7a-3718398c4517/'],
+            ['Hank April Fools Spray', 'https://link.brawlstars.com/en/voucher/963326be-8393-492e-91ea-b19325ffb088'],
+            ['Scroll Spray', 'https://link.brawlstars.com/en/voucher/974a1b0f-b2f7-45c5-978e-bdade83062a1'],
+          ],
+        },
+      ];
+
+      // Components V2 container: text, separators and link buttons all live inside one box.
+      // Discord allows 40 components per message; this layout uses well under that
+      // (link buttons are grouped into rows of 4 instead of one Section per link).
+      const container = new ContainerBuilder()
+        .setAccentColor(COLOR)
+        .addTextDisplayComponents(
+          new TextDisplayBuilder().setContent(
+            '## 🎁 Free Brawl Stars Freebies\nTap a button below to claim the item. Each link is a voucher for that reward.',
+          ),
+        );
+
+      for (const category of FREEBIES) {
+        container
+          .addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small))
+          .addTextDisplayComponents(new TextDisplayBuilder().setContent(`### ${category.title}`));
+
+        for (let i = 0; i < category.items.length; i += 4) {
+          const row = new ActionRowBuilder().addComponents(
+            category.items
+              .slice(i, i + 4)
+              .map(([label, url]) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url)),
+          );
+          container.addActionRowComponents(row);
+        }
+      }
+
+      container
+        .addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small))
+        .addTextDisplayComponents(
+          new TextDisplayBuilder().setContent('-# FreePass - The only legit place to get freebies!'),
+        );
+
+      // channel.send posts a brand new message; it is not a reply to the command.
+      try {
+        await channel.send({
+          components: [container],
+          flags: MessageFlags.IsComponentsV2,
+          allowedMentions: NO_MENTIONS,
+        });
+      } catch (err) {
+        await send(interaction, embed(null, `Couldn't post here: ${err.message}`), { ephemeral: true });
+        return;
+      }
+
+      // Slash commands must be acknowledged; keep it private so the channel only shows the freebies.
+      await send(interaction, embed(null, 'Freebies message posted.'), { ephemeral: true });
     },
   },
 ];
