@@ -142,6 +142,10 @@ const q = {
     SELECT inviter_id, joins, leaves, (joins - leaves) AS current
     FROM inviter_stats WHERE guild_id = ? AND joins > 0
     ORDER BY current DESC, joins DESC LIMIT ?`),
+  listInviters: db.prepare(`
+    SELECT inviter_id, (joins - leaves) AS current
+    FROM inviter_stats WHERE guild_id = ? AND (joins - leaves) >= 1
+    ORDER BY current DESC, joins DESC, inviter_id ASC`),
   deleteStats: db.prepare('DELETE FROM inviter_stats WHERE guild_id = ? AND inviter_id = ?'),
   uncountJoins: db.prepare('UPDATE joins SET counted = 0 WHERE guild_id = ? AND inviter_id = ?'),
 };
@@ -224,6 +228,11 @@ function getLeaderboard(guildId, limit = 10) {
     leaves: r.leaves,
     current: r.current,
   }));
+}
+
+/** Everyone with 1 or more current invites, highest first. */
+function getInviterList(guildId) {
+  return q.listInviters.all(guildId).map((r) => ({ inviterId: r.inviter_id, current: r.current }));
 }
 
 /** Resets stats. Old join records stay (for /user) but stop counting. */
@@ -492,9 +501,24 @@ async function nameOf(guild, userId) {
   return escapeMarkdown(name);
 }
 
-/** The invite announcement. Shared by real joins and /test. Names only, no pings. */
+/**
+ * The invite announcement. Shared by real joins, /test and /placeholder. Names only, no pings.
+ * Shows a progress bar toward the next reward they can't claim yet (e.g. 6/9 for Pro Pass),
+ * plus everything they can already claim.
+ */
 function inviteText(inviterName, inviteeName, count) {
-  return `**${inviterName}** invited **${inviteeName}** to the server.\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}! 👤`;
+  let text = `**${inviterName}** invited **${inviteeName}** to the server.\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}! 👤`;
+
+  const next = REWARDS.find((r) => r.invites > count);
+  const claimable = REWARDS.filter((r) => r.invites <= count);
+
+  if (next) {
+    text += `\n\n${progressBar(count, next.invites)} **${count}/${next.invites}** for ${emojiText(next.emoji)} **${next.name}**`;
+  }
+  if (claimable.length > 0) {
+    text += `\n✅ Can claim: ${claimable.map((r) => `${emojiText(r.emoji)} **${r.name}**`).join(', ')}`;
+  }
+  return text;
 }
 
 async function sendJoinMessage(member, detected) {
@@ -574,9 +598,11 @@ const TUTORIAL_URL = 'https://discord.com/channels/1379048382684987463/137975584
 const stepFooter = (n) => ({ text: `Step ${n}/3` });
 
 /** Text progress bar with one symbol per required invite, e.g. 2/6 -> ▰▰▱▱▱▱. */
+const BAR_FILLED = '▰';
+const BAR_EMPTY = '▱';
 function progressBar(current, total) {
   const filled = Math.min(Math.max(0, Math.floor(current)), total);
-  return '▰'.repeat(filled) + '▱'.repeat(total - filled);
+  return BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(total - filled);
 }
 
 /** Step 1/3: the private claim menu. The user's current invite total is shown at the top. */
@@ -637,11 +663,11 @@ function tagPayload(reward) {
 }
 
 /**
- * Step 3/3: for now always the "not enough invites" view (testing). The bar never reaches
- * the goal: with enough invites it shows one below it (e.g. 8/9 instead of 10/9).
+ * Step 3/3: for now always the "not enough invites" view (testing). The shown invites are capped
+ * at TEST_DISPLAY_INVITE_CAP (2), so every reward shows 2/X no matter how many invites they have.
  */
 function resultPayload(reward, have) {
-  have = Math.min(have, reward.invites - 1);
+  have = Math.min(have, TEST_DISPLAY_INVITE_CAP, reward.invites - 1);
 
   const missing = reward.invites - have;
   const e = embed(
@@ -694,25 +720,24 @@ function normalizeTag(raw) {
   return `#${text.replace(/^#/, '').toUpperCase()}`;
 }
 
-/** Posts one log embed per claim attempt (success or failure). Never throws. */
-async function logClaimAttempt(interaction, { reward, tag, have, success }) {
+/** Posts one log embed per claim attempt (no success/failure split, just the attempt). Never throws. */
+async function logClaimAttempt(interaction, { reward, tag, have }) {
   try {
     const channel = await getLogChannel(interaction.guild);
     if (!channel) return;
 
     const avatar = interaction.user.displayAvatarURL();
     const log = embed(
-      success ? '✅ Claim succeeded' : '❌ Claim failed',
-      success
-        ? 'The member had enough invites.'
-        : `The member didn't have enough invites (${reward.invites - have} short).`,
+      '📥 Claim attempt',
+      `<@${interaction.user.id}> tried to claim ${emojiText(reward.emoji)} **${reward.name}**.`,
     )
       .setAuthor({ name: interaction.user.username, iconURL: avatar })
       .setThumbnail(avatar)
       .addFields(
         { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-        { name: 'Reward', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
-        { name: 'Invites', value: `${have}/${reward.invites}`, inline: true },
+        { name: 'Total invites', value: `**${have}**`, inline: true },
+        { name: 'Tried to buy', value: `${emojiText(reward.emoji)} ${reward.name}`, inline: true },
+        { name: 'Cost', value: `${reward.invites} invites`, inline: true },
         { name: 'Player tag', value: `\`${tag}\``, inline: true },
       )
       .setTimestamp();
@@ -802,11 +827,10 @@ async function handleTagModal(interaction) {
   }
 
   const have = Math.max(0, getStats(interaction.guildId, interaction.user.id).current);
-  const success = have >= reward.invites;
 
   // TODO: once claiming exists, pass `tag` along to the staff request.
   await interaction.update({ ...resultPayload(reward, have), attachments: [] });
-  await logClaimAttempt(interaction, { reward, tag, have, success });
+  await logClaimAttempt(interaction, { reward, tag, have });
 }
 
 // ---- Reviews: "Submit Review" button -> popup (rating, description, screenshot) -> posted in the reviews channel ----
@@ -1251,7 +1275,7 @@ function placeholderPanel(guildId, notice) {
     lines.push(`**On** in ${trackingId ? `<#${trackingId}>` : 'no channel (use /set)'}. Next invite ${relativeDate(run.nextAt)}.`, '');
     if (run.active.length === 0) lines.push('Picking inviters...');
     for (const a of run.active) {
-      const bar = '▰'.repeat(a.count) + '▱'.repeat(PLACEHOLDER_MAX_INVITES - a.count);
+      const bar = progressBar(a.count, PLACEHOLDER_MAX_INVITES);
       lines.push(`**${escapeMarkdown(a.name)}**  ${bar}  ${a.count}/${PLACEHOLDER_MAX_INVITES}`);
     }
     lines.push('', `Invites posted: **${run.sent}** · Offline members queued: **${run.pool.length}**`);
@@ -1296,6 +1320,63 @@ async function handlePlaceholderButton(interaction) {
     }
   }
   await interaction.editReply(placeholderPanel(guild.id, notice));
+}
+
+// ---------------------------------------------------------------------------
+// /list: owner-only. Everyone with 1+ invites, highest to lowest, LIST_PAGE_SIZE per page.
+// Left/right buttons only appear when there is more than one page.
+// customIds: list:prev:<page> and list:next:<page> (<page> is the page being shown now).
+// ---------------------------------------------------------------------------
+const LIST_PREFIX = 'list:';
+const LIST_PAGE_SIZE = 10;
+
+function listPayload(guildId, requestedPage = 0) {
+  const rows = getInviterList(guildId);
+  if (rows.length === 0) {
+    return {
+      embeds: [embed('Invite list', 'Nobody has 1 or more invites yet.')],
+      components: [],
+      allowedMentions: NO_MENTIONS,
+    };
+  }
+
+  const pages = Math.ceil(rows.length / LIST_PAGE_SIZE);
+  const page = Math.min(Math.max(0, requestedPage), pages - 1);
+  const start = page * LIST_PAGE_SIZE;
+
+  const lines = rows
+    .slice(start, start + LIST_PAGE_SIZE)
+    .map((r, i) => `**${start + i + 1}.** <@${r.inviterId}> - **${r.current}** ${r.current === 1 ? 'invite' : 'invites'}`);
+
+  const e = embed('Invite list', lines.join('\n')).setFooter({
+    text: `Page ${page + 1}/${pages} · ${rows.length} ${rows.length === 1 ? 'member' : 'members'}`,
+  });
+
+  const components = [];
+  if (pages > 1) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${LIST_PREFIX}prev:${page}`)
+          .setEmoji('⬅️')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page === 0),
+        new ButtonBuilder()
+          .setCustomId(`${LIST_PREFIX}next:${page}`)
+          .setEmoji('➡️')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page >= pages - 1),
+      ),
+    );
+  }
+
+  return { embeds: [e], components, allowedMentions: NO_MENTIONS };
+}
+
+async function handleListButton(interaction) {
+  const [, direction, current] = interaction.customId.split(':');
+  const page = (Number(current) || 0) + (direction === 'next' ? 1 : -1);
+  await interaction.update(listPayload(interaction.guildId, page));
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,6 +1592,18 @@ const commands = [
           `**${i + 1}.** <@${r.inviterId}> - **${r.current}** current (${r.joins} joins, ${r.leaves} leaves)`,
       );
       await send(interaction, embed('Invite leaderboard', lines.join('\n')));
+    },
+  },
+
+  // /list
+  {
+    data: new SlashCommandBuilder()
+      .setName('list')
+      .setDescription('Show everyone with 1 or more invites, highest to lowest')
+      .setContexts(InteractionContextType.Guild),
+
+    async execute(interaction) {
+      await safeReply(interaction, listPayload(interaction.guildId));
     },
   },
 
@@ -2037,6 +2130,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId.startsWith(USER_PREFIX)
     ) {
       await handleUserPanel(interaction);
+      return;
+    }
+
+    // /list page buttons (owner only, checked above).
+    if (interaction.inGuild() && interaction.isButton() && interaction.customId.startsWith(LIST_PREFIX)) {
+      await handleListButton(interaction);
       return;
     }
 
