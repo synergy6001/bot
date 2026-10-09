@@ -494,52 +494,64 @@ async function detectInvite(guild) {
 }
 
 /** A person's display name (server nickname > global display name > username), markdown-escaped. */
-async function nameOf(guild, userId) {
+async function nameOf(guild, userId, { raw = false } = {}) {
   const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
   const user = member?.user ?? (await guild.client.users.fetch(userId).catch(() => null));
   const name = member?.displayName ?? user?.globalName ?? user?.username ?? 'Unknown';
-  return escapeMarkdown(name);
+  return raw ? name : escapeMarkdown(name);
+}
+
+/** Profile picture URL for a user (server avatar if they have one), or null if it can't be found. */
+async function avatarOf(guild, userId) {
+  const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+  const user = member?.user ?? (await guild.client.users.fetch(userId).catch(() => null));
+  return member?.displayAvatarURL() ?? user?.displayAvatarURL() ?? null;
 }
 
 /**
  * The invite announcement. Shared by real joins, /test and /placeholder. Names only, no pings.
- * Shows a progress bar toward the next reward they can't claim yet (e.g. 6/9 for Pro Pass),
- * plus everything they can already claim.
+ * The title line shows the inviter's profile picture and their invite total. A short "ready to
+ * claim" line (and a green bar) only appears when the total lands exactly on a reward milestone
+ * (3, 6, 9). Pass raw (unescaped) names.
  */
-function inviteText(inviterName, inviteeName, count) {
-  let text = `**${inviterName}** invited **${inviteeName}** to the server.\nThey now have **${count}** ${count === 1 ? 'invite' : 'invites'}! 👤`;
+function inviteEmbed(inviterName, inviteeName, count, avatarURL) {
+  const unlocked = REWARDS.find((r) => r.invites === count);
 
-  const next = REWARDS.find((r) => r.invites > count);
-  const claimable = REWARDS.filter((r) => r.invites <= count);
+  let text = `**${escapeMarkdown(inviteeName)}** joined using **${escapeMarkdown(inviterName)}**'s invite.`;
+  if (unlocked) text += `\n\n✅ ${emojiText(unlocked.emoji)} **${unlocked.name}** is ready to claim.`;
 
-  if (next) {
-    text += `\n\n${progressBar(count, next.invites)} **${count}/${next.invites}** for ${emojiText(next.emoji)} **${next.name}**`;
-  }
-  if (claimable.length > 0) {
-    text += `\n✅ Can claim: ${claimable.map((r) => `${emojiText(r.emoji)} **${r.name}**`).join(', ')}`;
-  }
-  return text;
+  const e = embed(null, text).setAuthor({
+    name: `${inviterName} now has ${count} ${count === 1 ? 'invite' : 'invites'} 👤`,
+    ...(avatarURL ? { iconURL: avatarURL } : {}),
+  });
+  if (unlocked) e.setColor(SUCCESS_COLOR);
+  return e;
 }
 
 async function sendJoinMessage(member, detected) {
   const channel = await getTrackingChannel(member.guild);
   if (!channel) return;
 
-  const inviteeName = escapeMarkdown(member.displayName);
-  let text;
+  const inviteeName = member.displayName;
+  let message;
   if (detected.source === 'vanity') {
-    text = `**${inviteeName}** joined via the vanity URL.`;
+    message = embed(null, `**${escapeMarkdown(inviteeName)}** joined via the vanity URL.`);
   } else if (detected.inviterId) {
     // Tracking already happened in handleJoin; past the cap we just don't announce it.
     const count = getStats(member.guild.id, detected.inviterId).current;
     if (count > TEST_DISPLAY_INVITE_CAP) return;
-    text = inviteText(await nameOf(member.guild, detected.inviterId), inviteeName, count);
+    message = inviteEmbed(
+      await nameOf(member.guild, detected.inviterId, { raw: true }),
+      inviteeName,
+      count,
+      await avatarOf(member.guild, detected.inviterId),
+    );
   } else {
-    text = `**${inviteeName}** joined (inviter unknown).`;
+    message = embed(null, `**${escapeMarkdown(inviteeName)}** joined (inviter unknown).`);
   }
 
   try {
-    await channel.send({ embeds: [embed(null, text)], allowedMentions: NO_MENTIONS });
+    await channel.send({ embeds: [message], allowedMentions: NO_MENTIONS });
   } catch (err) {
     console.warn(`[${member.guild.name}] Could not send join message:`, err.message);
   }
@@ -1099,28 +1111,43 @@ async function handleUserPanel(interaction) {
 
 // ---- /placeholder: sample invite messages to preview an active server ----
 // Owner only, off by default, in-memory only (a restart turns it off). /placeholder opens a private panel
-// (only you see it) with the current inviters, their progress to 6, an Update button and an On/Off button.
-// Messages are posted in the invite tracking channel set with /set (the same one real invite messages use).
+// (only you see it) with the 4 placeholder rows, their progress, an Update button, an On/Off button and an
+// "Edit a row" menu. Messages are posted in the invite tracking channel set with /set.
+//
+// Each of the 4 ROWS has its own settings (kept per server while the bot runs, even when turned off):
+//   - on/off: a row can be switched off on its own, so 1, 2, 3 or all 4 rows run
+//   - how quickly it invites: a range like 1-10m (a random gap inside the range before every invite)
+//   - when its person switches: after this many invites (default 6) the row picks a new random user
+// Editing a row changes the row, never a specific user. Every row runs on its own timer.
 //
 // Names come from OFFLINE members, picked a few at a time, never by loading the whole member list:
 //   1. one REST page of members is read from a random point in the member list,
 //   2. only a small shuffled batch of those ids is checked for presence over the gateway,
 //   3. offline, non-bot members are kept until enough are found.
-// A handful of inviters are active at once. Every 3 to 10 minutes one of them invites a member from a small
-// queue (each queued member is used once). An inviter who reaches 6 is replaced by a new offline member.
 // It never touches the database, stats or real invites, and the invite display cap does NOT apply here.
-const PLACEHOLDER_ACTIVE_INVITERS = 4;
-const PLACEHOLDER_MAX_INVITES = 6;
-const PLACEHOLDER_MIN_DELAY_MS = 3 * 60_000;
-const PLACEHOLDER_MAX_DELAY_MS = 10 * 60_000;
+const PLACEHOLDER_ROWS = 4;
+const PLACEHOLDER_DEFAULT_SWITCH = 6;
+// Defaults per row. Four rows at 12-40m is about the same overall pace as the old single 3-10m timer.
+const PLACEHOLDER_DEFAULT_MIN_MS = 12 * 60_000;
+const PLACEHOLDER_DEFAULT_MAX_MS = 40 * 60_000;
+const PLACEHOLDER_LIMIT_MIN_MS = 5_000; // fastest allowed gap
+const PLACEHOLDER_LIMIT_MAX_MS = 24 * 60 * 60_000; // slowest allowed gap
+const PLACEHOLDER_MAX_SWITCH = 100;
 const PLACEHOLDER_POOL_BATCH = 10; // how many offline members to queue per lookup
+const PLACEHOLDER_PREFIX = 'placeholder:';
 const PLACEHOLDER_UPDATE_ID = 'placeholder:update';
 const PLACEHOLDER_TOGGLE_ID = 'placeholder:toggle';
+const PLACEHOLDER_ROW_SELECT_ID = 'placeholder:row';
+const PLACEHOLDER_ROW_TOGGLE_PREFIX = 'placeholder:rowtoggle:'; // placeholder:rowtoggle:<row index>
+const PLACEHOLDER_MODAL_PREFIX = 'placeholder:modal:'; // placeholder:modal:<row index>
+const PLACEHOLDER_RANGE_INPUT_ID = 'range';
+const PLACEHOLDER_SWITCH_INPUT_ID = 'switch';
 const DISCORD_EPOCH = 1420070400000n;
 
-// guildId -> { timer, nextAt, sent, active: [{ id, name, count }], pool: [{ id, name }], seen: Set }
+// guildId -> { sent, slots: [{ index, id, name, avatar, count, timer, nextAt, gen }], pool, seen: Set, queue }
 const placeholderRuns = new Map();
 const placeholderStopped = new Map(); // guildId -> why it stopped by itself (shown once on the panel)
+const placeholderConfigs = new Map(); // guildId -> [{ enabled, minMs, maxMs, switchAt }] x PLACEHOLDER_ROWS
 
 const randomItem = (list) => list[Math.floor(Math.random() * list.length)];
 
@@ -1130,6 +1157,66 @@ function shuffle(list) {
     [list[i], list[j]] = [list[j], list[i]];
   }
   return list;
+}
+
+// ---- per-row settings ----
+function getPlaceholderRows(guildId) {
+  let rows = placeholderConfigs.get(guildId);
+  if (!rows) {
+    rows = Array.from({ length: PLACEHOLDER_ROWS }, () => ({
+      enabled: true,
+      minMs: PLACEHOLDER_DEFAULT_MIN_MS,
+      maxMs: PLACEHOLDER_DEFAULT_MAX_MS,
+      switchAt: PLACEHOLDER_DEFAULT_SWITCH,
+    }));
+    placeholderConfigs.set(guildId, rows);
+  }
+  return rows;
+}
+
+/** 90000 -> "1.5m", 30000 -> "30s", 7200000 -> "2h". */
+function formatMs(ms) {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  return `${+(ms / 60_000).toFixed(1)}m`;
+}
+
+/** Text shown on the panel, e.g. "1-10m". */
+function formatRange(cfg) {
+  if (cfg.minMs === cfg.maxMs) return formatMs(cfg.minMs);
+  if (cfg.minMs % 60_000 === 0 && cfg.maxMs % 60_000 === 0) return `${cfg.minMs / 60_000}-${cfg.maxMs / 60_000}m`;
+  return `${formatMs(cfg.minMs)}-${formatMs(cfg.maxMs)}`;
+}
+
+/**
+ * Reads "1-10m", "1-10", "30s-2m", "5m" or "5". A part without a unit uses the other part's unit
+ * (minutes if neither has one). Returns { minMs, maxMs } or an error string.
+ */
+function parseDurationRange(raw) {
+  const text = raw.toLowerCase().replace(/\s+/g, '').replace(/[–—]/g, '-');
+  const parts = text.split('-');
+  if (parts.length < 1 || parts.length > 2 || parts.some((p) => !p)) return 'Use a range like `1-10m`.';
+
+  const re = /^(\d+(?:\.\d+)?)(s|sec|m|min|h|hr)?$/;
+  const parsed = [];
+  for (const part of parts) {
+    const match = re.exec(part);
+    if (!match) return 'Use a range like `1-10m`, `30s-2m` or a single time like `5m`.';
+    parsed.push({ value: Number(match[1]), unit: match[2] ? match[2][0] : null });
+  }
+
+  const fallbackUnit = parsed.find((p) => p.unit)?.unit ?? 'm';
+  const mult = { s: 1000, m: 60_000, h: 3_600_000 };
+  const values = parsed.map((p) => Math.round(p.value * mult[p.unit ?? fallbackUnit]));
+  if (values.length === 1) values.push(values[0]);
+
+  const [a, b] = values;
+  const minMs = Math.min(a, b);
+  const maxMs = Math.max(a, b);
+  if (minMs < PLACEHOLDER_LIMIT_MIN_MS) return `The fastest allowed is ${formatMs(PLACEHOLDER_LIMIT_MIN_MS)}.`;
+  if (maxMs > PLACEHOLDER_LIMIT_MAX_MS) return `The slowest allowed is ${formatMs(PLACEHOLDER_LIMIT_MAX_MS)}.`;
+  return { minMs, maxMs };
 }
 
 /** A random snowflake between 2016 and now, used as the starting point of one page of members. */
@@ -1165,7 +1252,7 @@ async function pickOfflineMembers(guild, need, exclude) {
         if (picked.length >= need) break;
         const status = m.presence?.status;
         if (m.user.bot || taken.has(m.id) || (status && status !== 'offline')) continue;
-        picked.push({ id: m.id, name: m.displayName });
+        picked.push({ id: m.id, name: m.displayName, avatar: m.displayAvatarURL() });
         taken.add(m.id);
       }
     }
@@ -1178,8 +1265,8 @@ async function takeFromPool(guild, run) {
   if (run.pool.length === 0) {
     let found = await pickOfflineMembers(guild, PLACEHOLDER_POOL_BATCH, run.seen);
     if (found.length === 0 && run.seen.size > 0) {
-      // Everyone available was already used (small server): allow reuse, but never the active inviters.
-      run.seen = new Set(run.active.map((a) => a.id));
+      // Everyone available was already used (small server): allow reuse, but never the current inviters.
+      run.seen = new Set(run.slots.filter((s) => s.id).map((s) => s.id));
       found = await pickOfflineMembers(guild, PLACEHOLDER_POOL_BATCH, run.seen);
     }
     run.pool.push(...found);
@@ -1189,115 +1276,319 @@ async function takeFromPool(guild, run) {
   return member;
 }
 
-/** Tops the active inviters back up to PLACEHOLDER_ACTIVE_INVITERS. */
-async function fillInviters(guild, run) {
-  while (run.active.length < PLACEHOLDER_ACTIVE_INVITERS) {
-    const member = await takeFromPool(guild, run);
-    if (!member) break;
-    run.active.push({ ...member, count: 0 });
-  }
-  if (run.active.length === 0) throw new Error("Couldn't find any offline members.");
+/** Gives a row a new random offline member (count back to 0). The row keeps its settings. */
+async function fillSlot(guild, run, slot) {
+  const member = await takeFromPool(guild, run);
+  if (!member) return false;
+  slot.id = member.id;
+  slot.name = member.name;
+  slot.avatar = member.avatar;
+  slot.count = 0;
+  return true;
 }
 
 function stopPlaceholder(guildId) {
   const run = placeholderRuns.get(guildId);
   if (!run) return false;
-  clearTimeout(run.timer);
+  for (const slot of run.slots) {
+    slot.gen += 1;
+    clearTimeout(slot.timer);
+  }
   placeholderRuns.delete(guildId);
   return true;
 }
 
 async function startPlaceholder(guild) {
-  const run = { timer: null, nextAt: 0, sent: 0, active: [], pool: [], seen: new Set() };
+  const run = {
+    sent: 0,
+    slots: Array.from({ length: PLACEHOLDER_ROWS }, (_, index) => ({
+      index, id: null, name: '', avatar: null, count: 0, timer: null, nextAt: 0, gen: 0,
+    })),
+    pool: [],
+    seen: new Set(),
+    queue: Promise.resolve(), // rows take turns, so two rows never look up members at the same time
+  };
   placeholderRuns.set(guild.id, run);
   placeholderStopped.delete(guild.id);
   try {
-    await fillInviters(guild, run);
+    const rows = getPlaceholderRows(guild.id);
+    for (const slot of run.slots) {
+      if (!rows[slot.index].enabled) continue;
+      if (!(await fillSlot(guild, run, slot))) break; // small server: the remaining rows stay empty
+      if (placeholderRuns.get(guild.id) !== run) return; // switched off while looking up members
+    }
+    if (!run.slots.some((s) => s.id)) throw new Error("Couldn't find any offline members.");
   } catch (err) {
     if (placeholderRuns.get(guild.id) === run) placeholderRuns.delete(guild.id);
     throw err;
   }
-  if (placeholderRuns.get(guild.id) !== run) return; // switched off while looking up members
-  schedulePlaceholder(guild.id);
+  if (placeholderRuns.get(guild.id) !== run) return;
+  const enabledRows = getPlaceholderRows(guild.id);
+  for (const slot of run.slots) if (enabledRows[slot.index].enabled) schedulePlaceholderRow(guild.id, slot);
 }
 
-function schedulePlaceholder(guildId) {
+/** (Re)starts one row's timer using that row's own range. */
+function schedulePlaceholderRow(guildId, slot) {
   const run = placeholderRuns.get(guildId);
   if (!run) return;
 
-  // Random gap of 3 to 10 minutes so it doesn't look like a clock.
-  const delay = PLACEHOLDER_MIN_DELAY_MS + Math.floor(Math.random() * (PLACEHOLDER_MAX_DELAY_MS - PLACEHOLDER_MIN_DELAY_MS));
-  run.nextAt = Date.now() + delay;
-  run.timer = setTimeout(async () => {
-    if (placeholderRuns.get(guildId) !== run) return;
+  clearTimeout(slot.timer);
+  slot.gen += 1;
+  const gen = slot.gen;
 
-    try {
-      const guild = client.guilds.cache.get(guildId);
-      if (!guild) throw new Error('Server not available.');
+  const cfg = getPlaceholderRows(guildId)[slot.index];
+  if (!cfg.enabled) return; // this row is switched off
+  // Random gap inside the row's range so it doesn't look like a clock.
+  const delay = cfg.minMs + Math.floor(Math.random() * (cfg.maxMs - cfg.minMs + 1));
+  slot.nextAt = Date.now() + delay;
+  slot.timer = setTimeout(() => {
+    run.queue = run.queue
+      .then(() => placeholderTick(guildId, run, slot, gen))
+      .catch((err) => console.error('[placeholder] Tick error:', err));
+  }, delay);
+}
 
-      await fillInviters(guild, run);
-      const invitee = await takeFromPool(guild, run);
-      if (placeholderRuns.get(guildId) !== run) return; // switched off while looking up members
-      if (!invitee) throw new Error('Ran out of offline members to use.');
+async function placeholderTick(guildId, run, slot, gen) {
+  const current = () => placeholderRuns.get(guildId) === run && slot.gen === gen;
+  if (!current()) return;
 
-      const inviter = randomItem(run.active);
-      const channel = await getTrackingChannel(guild);
-      if (!channel) throw new Error('No invite tracking channel is set (use /set).');
-      // No display cap here: the real count is shown (the cap only applies to real invite messages).
-      await channel.send({
-        embeds: [embed(null, inviteText(escapeMarkdown(inviter.name), escapeMarkdown(invitee.name), inviter.count + 1))],
-        allowedMentions: NO_MENTIONS,
-      });
+  try {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) throw new Error('Server not available.');
 
-      run.sent += 1;
-      inviter.count += 1;
-      if (inviter.count >= PLACEHOLDER_MAX_INVITES) {
-        // Reached the max: swap in a new offline member (a failed lookup is retried on the next tick).
-        run.active.splice(run.active.indexOf(inviter), 1);
-        await fillInviters(guild, run).catch((err) => console.warn('[placeholder] Refill failed:', err.message));
+    // A row without a person (a failed lookup earlier, or a tiny server) tries again each tick.
+    if (!slot.id) await fillSlot(guild, run, slot);
+    if (!current()) return;
+    if (!slot.id) {
+      const rowCfgs = getPlaceholderRows(guildId);
+      if (run.slots.filter((s) => rowCfgs[s.index].enabled).every((s) => !s.id)) {
+        throw new Error("Couldn't find any offline members.");
       }
-    } catch (err) {
-      console.warn(`[placeholder] Stopping in guild ${guildId}:`, err.message);
-      placeholderStopped.set(guildId, err.message);
-      stopPlaceholder(guildId);
+      schedulePlaceholderRow(guildId, slot);
       return;
     }
-    if (placeholderRuns.get(guildId) === run) schedulePlaceholder(guildId);
-  }, delay);
+
+    const invitee = await takeFromPool(guild, run);
+    if (!current()) return; // switched off (or the row was edited) while looking up members
+    if (!invitee) throw new Error('Ran out of offline members to use.');
+
+    const channel = await getTrackingChannel(guild);
+    if (!channel) throw new Error('No invite tracking channel is set (use /set).');
+    // No display cap here: the real count is shown (the cap only applies to real invite messages).
+    await channel.send({
+      embeds: [inviteEmbed(slot.name, invitee.name, slot.count + 1, slot.avatar)],
+      allowedMentions: NO_MENTIONS,
+    });
+
+    run.sent += 1;
+    slot.count += 1;
+    if (slot.count >= getPlaceholderRows(guildId)[slot.index].switchAt) {
+      // Reached this row's switch point: the row gets a new offline member (a failed lookup is retried next tick).
+      slot.id = null;
+      await fillSlot(guild, run, slot).catch((err) => console.warn('[placeholder] Refill failed:', err.message));
+    }
+  } catch (err) {
+    console.warn(`[placeholder] Stopping in guild ${guildId}:`, err.message);
+    placeholderStopped.set(guildId, err.message);
+    stopPlaceholder(guildId);
+    return;
+  }
+  if (current()) schedulePlaceholderRow(guildId, slot);
 }
 
 function placeholderPanel(guildId, notice) {
   const run = placeholderRuns.get(guildId);
+  const rows = getPlaceholderRows(guildId);
   const lines = [];
 
   if (run) {
     const trackingId = getChannelId(guildId);
-    lines.push(`**On** in ${trackingId ? `<#${trackingId}>` : 'no channel (use /set)'}. Next invite ${relativeDate(run.nextAt)}.`, '');
-    if (run.active.length === 0) lines.push('Picking inviters...');
-    for (const a of run.active) {
-      const bar = progressBar(a.count, PLACEHOLDER_MAX_INVITES);
-      lines.push(`**${escapeMarkdown(a.name)}**  ${bar}  ${a.count}/${PLACEHOLDER_MAX_INVITES}`);
+    lines.push(`**On** in ${trackingId ? `<#${trackingId}>` : 'no channel (use /set)'}.`, '');
+    for (const slot of run.slots) {
+      const cfg = rows[slot.index];
+      const n = slot.index + 1;
+      if (!cfg.enabled) {
+        lines.push(`**${n}.** Off`);
+        continue;
+      }
+      if (slot.id) {
+        const bar = cfg.switchAt <= 12 ? `  ${progressBar(slot.count, cfg.switchAt)}` : '';
+        lines.push(`**${n}. ${escapeMarkdown(slot.name)}**${bar}  ${slot.count}/${cfg.switchAt}`);
+      } else {
+        lines.push(`**${n}.** Picking a member...`);
+      }
+      lines.push(`every ${formatRange(cfg)} · next ${relativeDate(slot.nextAt)}`);
     }
     lines.push('', `Invites posted: **${run.sent}** · Offline members queued: **${run.pool.length}**`);
   } else {
-    lines.push('**Off**. Press **Turn on** to start posting sample invites in the invite tracking channel.');
+    lines.push('**Off**. Press **Turn on** to start posting sample invites in the invite tracking channel.', '');
+    rows.forEach((cfg, i) =>
+      lines.push(
+        cfg.enabled
+          ? `**Row ${i + 1}** · every ${formatRange(cfg)} · switches after ${cfg.switchAt}`
+          : `**Row ${i + 1}** · off`,
+      ),
+    );
     const why = placeholderStopped.get(guildId);
     if (why) lines.push('', `Stopped on its own: ${why}`);
   }
   if (notice) lines.push('', notice);
 
-  const row = new ActionRowBuilder().addComponents(
+  const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(PLACEHOLDER_UPDATE_ID).setLabel('Update').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(PLACEHOLDER_TOGGLE_ID)
       .setLabel(run ? 'Turn off' : 'Turn on')
       .setStyle(run ? ButtonStyle.Danger : ButtonStyle.Success),
   );
-  return { embeds: [embed('Placeholder invites', lines.join('\n'))], components: [row], allowedMentions: NO_MENTIONS };
+  const menu = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(PLACEHOLDER_ROW_SELECT_ID)
+      .setPlaceholder('Edit a row')
+      .addOptions(
+        rows.map((cfg, i) => ({
+          label: `Row ${i + 1}`,
+          description: `${cfg.enabled ? '' : 'OFF · '}every ${formatRange(cfg)} · switches after ${cfg.switchAt}`,
+          value: String(i),
+        })),
+      ),
+  );
+  const rowButtons = new ActionRowBuilder().addComponents(
+    rows.map((cfg, i) =>
+      new ButtonBuilder()
+        .setCustomId(`${PLACEHOLDER_ROW_TOGGLE_PREFIX}${i}`)
+        .setLabel(`Row ${i + 1}: ${cfg.enabled ? 'On' : 'Off'}`)
+        .setStyle(cfg.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+    ),
+  );
+  return {
+    embeds: [embed('Placeholder invites', lines.join('\n'))],
+    components: [buttons, rowButtons, menu],
+    allowedMentions: NO_MENTIONS,
+  };
 }
 
-async function handlePlaceholderButton(interaction) {
+/** Buttons, the row menu and the row popup of /placeholder. Only reached by the owner. */
+async function handlePlaceholderInteraction(interaction) {
   const guild = interaction.guild;
+
+  // Row menu: open the popup for that row.
+  if (interaction.isStringSelectMenu()) {
+    const index = Number(interaction.values[0]);
+    if (!Number.isInteger(index) || index < 0 || index >= PLACEHOLDER_ROWS) {
+      await interaction.update(placeholderPanel(guild.id));
+      return;
+    }
+    const cfg = getPlaceholderRows(guild.id)[index];
+    const rangeInput = new TextInputBuilder()
+      .setCustomId(PLACEHOLDER_RANGE_INPUT_ID)
+      .setLabel('How quickly? (range)')
+      .setPlaceholder('e.g: 1-10m or 30s-2m')
+      .setStyle(TextInputStyle.Short)
+      .setMinLength(1)
+      .setMaxLength(20)
+      .setValue(formatRange(cfg))
+      .setRequired(true);
+    const switchInput = new TextInputBuilder()
+      .setCustomId(PLACEHOLDER_SWITCH_INPUT_ID)
+      .setLabel('Switch person after how many invites?')
+      .setPlaceholder(`e.g: ${PLACEHOLDER_DEFAULT_SWITCH}`)
+      .setStyle(TextInputStyle.Short)
+      .setMinLength(1)
+      .setMaxLength(3)
+      .setValue(String(cfg.switchAt))
+      .setRequired(true);
+    await interaction.showModal(
+      new ModalBuilder()
+        .setCustomId(`${PLACEHOLDER_MODAL_PREFIX}${index}`)
+        .setTitle(`Edit row ${index + 1}`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(rangeInput),
+          new ActionRowBuilder().addComponents(switchInput),
+        ),
+    );
+    return;
+  }
+
+  // Row popup submitted.
+  if (interaction.isModalSubmit()) {
+    const index = Number(interaction.customId.slice(PLACEHOLDER_MODAL_PREFIX.length));
+    if (!interaction.isFromMessage() || !Number.isInteger(index) || index < 0 || index >= PLACEHOLDER_ROWS) {
+      await safeReply(interaction, errorReply('Something went wrong. Run `/placeholder` again.'));
+      return;
+    }
+
+    const range = parseDurationRange(interaction.fields.getTextInputValue(PLACEHOLDER_RANGE_INPUT_ID));
+    if (typeof range === 'string') {
+      await safeReply(interaction, errorReply(range));
+      return;
+    }
+    const rawSwitch = interaction.fields.getTextInputValue(PLACEHOLDER_SWITCH_INPUT_ID).trim();
+    const switchAt = /^\d{1,3}$/.test(rawSwitch) ? Number(rawSwitch) : 0;
+    if (switchAt < 1 || switchAt > PLACEHOLDER_MAX_SWITCH) {
+      await safeReply(interaction, errorReply(`Switch after a whole number from 1 to ${PLACEHOLDER_MAX_SWITCH}.`));
+      return;
+    }
+
+    const cfg = getPlaceholderRows(guild.id)[index];
+    cfg.minMs = range.minMs;
+    cfg.maxMs = range.maxMs;
+    cfg.switchAt = switchAt;
+
+    // If it is running, the row uses its new speed straight away.
+    const run = placeholderRuns.get(guild.id);
+    if (run && cfg.enabled) schedulePlaceholderRow(guild.id, run.slots[index]);
+
+    await interaction.deferUpdate();
+    await interaction.editReply(
+      placeholderPanel(guild.id, `✅ Row ${index + 1}: every **${formatRange(cfg)}**, switches after **${switchAt}**.`),
+    );
+    return;
+  }
+
+  // Row on/off buttons.
+  if (interaction.customId.startsWith(PLACEHOLDER_ROW_TOGGLE_PREFIX)) {
+    const index = Number(interaction.customId.slice(PLACEHOLDER_ROW_TOGGLE_PREFIX.length));
+    if (!Number.isInteger(index) || index < 0 || index >= PLACEHOLDER_ROWS) {
+      await interaction.update(placeholderPanel(guild.id));
+      return;
+    }
+    await interaction.deferUpdate(); // bringing a row back may need a member lookup
+    const rows = getPlaceholderRows(guild.id);
+    const cfg = rows[index];
+    cfg.enabled = !cfg.enabled;
+    let notice = `Row ${index + 1} turned ${cfg.enabled ? 'on' : 'off'}.`;
+
+    const run = placeholderRuns.get(guild.id);
+    if (run) {
+      const slot = run.slots[index];
+      if (!cfg.enabled) {
+        slot.gen += 1; // cancels this row's pending invite
+        clearTimeout(slot.timer);
+        if (!rows.some((r) => r.enabled)) {
+          stopPlaceholder(guild.id);
+          notice += ' No rows are left running, so placeholder is off.';
+        }
+      } else {
+        let failure = null;
+        run.queue = run.queue
+          .then(async () => {
+            if (placeholderRuns.get(guild.id) !== run) return;
+            if (!slot.id) await fillSlot(guild, run, slot);
+          })
+          .catch((err) => { failure = err; });
+        await run.queue;
+        if (failure) {
+          cfg.enabled = false;
+          notice = `Couldn't turn on row ${index + 1}: ${failure.message}`;
+        } else if (placeholderRuns.get(guild.id) === run) {
+          schedulePlaceholderRow(guild.id, slot);
+        }
+      }
+    }
+    await interaction.editReply(placeholderPanel(guild.id, notice));
+    return;
+  }
 
   if (interaction.customId === PLACEHOLDER_UPDATE_ID) {
     await interaction.update(placeholderPanel(guild.id));
@@ -1310,6 +1601,8 @@ async function handlePlaceholderButton(interaction) {
   if (placeholderRuns.has(guild.id)) {
     stopPlaceholder(guild.id);
     placeholderStopped.delete(guild.id);
+  } else if (!getPlaceholderRows(guild.id).some((r) => r.enabled)) {
+    notice = 'Turn on at least one row first.';
   } else if (!(await getTrackingChannel(guild))) {
     notice = 'Set the invite tracking channel first with /set.';
   } else {
@@ -1622,7 +1915,7 @@ const commands = [
     },
   },
 
-  // /placeholder  (public panel: inviter progress, Update, Turn on/off)
+  // /placeholder  (panel: row progress, Update, Turn on/off, edit each row's speed and switch point)
   {
     data: new SlashCommandBuilder()
       .setName('placeholder')
@@ -1703,10 +1996,10 @@ const commands = [
       // Preview only: nothing is written to the database. Shows the count as if
       // this were a real invite (current + 1).
       const count = getStats(interaction.guildId, interaction.user.id).current + 1;
-      const name = await nameOf(interaction.guild, interaction.user.id);
+      const name = await nameOf(interaction.guild, interaction.user.id, { raw: true });
       try {
         await channel.send({
-          embeds: [embed(null, inviteText(name, name, count))],
+          embeds: [inviteEmbed(name, name, count, interaction.user.displayAvatarURL())],
           allowedMentions: NO_MENTIONS,
         });
       } catch (err) {
@@ -2145,12 +2438,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    // /placeholder panel: buttons, the row menu and the row popup (owner only, checked above).
     if (
       interaction.inGuild() &&
-      interaction.isButton() &&
-      (interaction.customId === PLACEHOLDER_UPDATE_ID || interaction.customId === PLACEHOLDER_TOGGLE_ID)
+      (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()) &&
+      interaction.customId.startsWith(PLACEHOLDER_PREFIX)
     ) {
-      await handlePlaceholderButton(interaction);
+      await handlePlaceholderInteraction(interaction);
       return;
     }
 
