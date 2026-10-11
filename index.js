@@ -1623,7 +1623,6 @@ async function handlePlaceholderInteraction(interaction) {
 // ---------------------------------------------------------------------------
 const LIST_PREFIX = 'list:'; // list:prev|next|pick|send:<page>
 const LIST_PAGE_SIZE = 10;
-const CLAIM_CHANNEL_URL = 'https://discord.com/channels/1379048382684987463/1385501454818873375';
 const REMINDER_GAP_MS = 1500; // DMs go out one at a time with a pause, so Discord never sees a burst
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1724,9 +1723,11 @@ function reminderPayload(guild, currentInvites) {
   if (guild.iconURL()) footer.iconURL = guild.iconURL();
   e.setFooter(footer);
 
-  const go = new ButtonBuilder().setLabel('Go to claiming').setEmoji('📥').setStyle(ButtonStyle.Link).setURL(CLAIM_CHANNEL_URL);
+  // Link buttons are always gray in Discord (the color can't be changed).
+  const reviews = new ButtonBuilder().setLabel('Reviews').setEmoji('⭐').setStyle(ButtonStyle.Link).setURL(REVIEWS_URL);
+  const tutorial = new ButtonBuilder().setLabel('How to invite').setEmoji('❓').setStyle(ButtonStyle.Link).setURL(TUTORIAL_URL);
   return {
-    payload: { embeds: [e], components: [new ActionRowBuilder().addComponents(go)], allowedMentions: NO_MENTIONS },
+    payload: { embeds: [e], components: [new ActionRowBuilder().addComponents(reviews, tutorial)], allowedMentions: NO_MENTIONS },
     have,
     reward,
   };
