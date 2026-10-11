@@ -1617,14 +1617,22 @@ async function handlePlaceholderInteraction(interaction) {
 
 // ---------------------------------------------------------------------------
 // /list: owner-only. Everyone with 1+ invites, highest to lowest, LIST_PAGE_SIZE per page.
-// Left/right buttons only appear when there is more than one page.
+// Left/right buttons only appear when there is more than one page. A menu + "Send reminder" button DMs
+// the picked members an "Almost there" embed and reports delivery per member.
 // customIds: list:prev:<page> and list:next:<page> (<page> is the page being shown now).
 // ---------------------------------------------------------------------------
-const LIST_PREFIX = 'list:';
+const LIST_PREFIX = 'list:'; // list:prev|next|pick|send:<page>
 const LIST_PAGE_SIZE = 10;
+const CLAIM_CHANNEL_URL = 'https://discord.com/channels/1379048382684987463/1385501454818873375';
+const REMINDER_GAP_MS = 1500; // DMs go out one at a time with a pause, so Discord never sees a burst
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function listPayload(guildId, requestedPage = 0) {
-  const rows = getInviterList(guildId);
+/**
+ * One page of the list. `selected` is a Set of user ids ticked in the menu. The menu's own
+ * default values carry the selection, so nothing is stored in memory.
+ */
+async function listPayload(guild, requestedPage = 0, selected = new Set()) {
+  const rows = getInviterList(guild.id);
   if (rows.length === 0) {
     return {
       embeds: [embed('Invite list', 'Nobody has 1 or more invites yet.')],
@@ -1636,40 +1644,166 @@ function listPayload(guildId, requestedPage = 0) {
   const pages = Math.ceil(rows.length / LIST_PAGE_SIZE);
   const page = Math.min(Math.max(0, requestedPage), pages - 1);
   const start = page * LIST_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + LIST_PAGE_SIZE);
 
-  const lines = rows
-    .slice(start, start + LIST_PAGE_SIZE)
-    .map((r, i) => `**${start + i + 1}.** <@${r.inviterId}> - **${r.current}** ${r.current === 1 ? 'invite' : 'invites'}`);
+  const lines = pageRows.map(
+    (r, i) => `**${start + i + 1}.** <@${r.inviterId}> - **${r.current}** ${r.current === 1 ? 'invite' : 'invites'}`,
+  );
 
   const e = embed('Invite list', lines.join('\n')).setFooter({
     text: `Page ${page + 1}/${pages} · ${rows.length} ${rows.length === 1 ? 'member' : 'members'}`,
   });
 
-  const components = [];
+  // Menu of this page's members, so the owner can pick who gets a reminder DM.
+  const names = await Promise.all(pageRows.map((r) => nameOf(guild, r.inviterId, { raw: true })));
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`${LIST_PREFIX}pick:${page}`)
+    .setPlaceholder('Select members to send a reminder')
+    .setMinValues(0)
+    .setMaxValues(pageRows.length)
+    .addOptions(
+      pageRows.map((r, i) => ({
+        label: names[i].slice(0, 100) || 'Unknown',
+        description: `${r.current} ${r.current === 1 ? 'invite' : 'invites'}`,
+        value: r.inviterId,
+        default: selected.has(r.inviterId),
+      })),
+    );
+
+  const chosen = pageRows.filter((r) => selected.has(r.inviterId)).length;
+  const buttons = [];
   if (pages > 1) {
-    components.push(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`${LIST_PREFIX}prev:${page}`)
-          .setEmoji('⬅️')
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(page === 0),
-        new ButtonBuilder()
-          .setCustomId(`${LIST_PREFIX}next:${page}`)
-          .setEmoji('➡️')
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(page >= pages - 1),
-      ),
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`${LIST_PREFIX}prev:${page}`)
+        .setEmoji('⬅️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page === 0),
+      new ButtonBuilder()
+        .setCustomId(`${LIST_PREFIX}next:${page}`)
+        .setEmoji('➡️')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(page >= pages - 1),
     );
   }
+  buttons.push(
+    new ButtonBuilder()
+      .setCustomId(`${LIST_PREFIX}send:${page}`)
+      .setLabel(chosen > 0 ? `Send reminder (${chosen})` : 'Send reminder')
+      .setEmoji('🔔')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(chosen === 0),
+  );
 
-  return { embeds: [e], components, allowedMentions: NO_MENTIONS };
+  return {
+    embeds: [e],
+    components: [new ActionRowBuilder().addComponents(menu), new ActionRowBuilder().addComponents(buttons)],
+    allowedMentions: NO_MENTIONS,
+  };
+}
+
+/**
+ * The "Almost there" DM. TESTING: the shown invites are capped at TEST_DISPLAY_INVITE_CAP, so with
+ * the cap at 2 everyone sees 2/3 for Brawl Pass. Returns null if they already clear every reward.
+ */
+function reminderPayload(guild, currentInvites) {
+  const have = Math.min(Math.max(0, currentInvites), TEST_DISPLAY_INVITE_CAP);
+  const reward = REWARDS.find((r) => r.invites > have);
+  if (!reward) return null;
+
+  const missing = reward.invites - have;
+  const e = embed(
+    missing === 1 ? 'Almost there' : 'Keep going',
+    `This is an automatic reminder that you're just **${missing} ${missing === 1 ? 'invite' : 'invites'} away** ` +
+      `from unlocking ${emojiText(reward.emoji)} **${reward.name}**.\n\n` +
+      `**${have}/${reward.invites}** invites\n${progressBar(have, reward.invites)}\n\n` +
+      "Once you're there, head back to the server to start claiming (and leave a review 🙂).",
+  );
+  // The server name is shown so the DM never looks like it came from nowhere.
+  const footer = { text: `Sent from ${guild.name}` };
+  if (guild.iconURL()) footer.iconURL = guild.iconURL();
+  e.setFooter(footer);
+
+  const go = new ButtonBuilder().setLabel('Go to claiming').setEmoji('📥').setStyle(ButtonStyle.Link).setURL(CLAIM_CHANNEL_URL);
+  return {
+    payload: { embeds: [e], components: [new ActionRowBuilder().addComponents(go)], allowedMentions: NO_MENTIONS },
+    have,
+    reward,
+  };
+}
+
+/** Plain-English reason for a failed DM. */
+function dmFailureReason(err) {
+  switch (err?.code) {
+    case 50007:
+      return 'Their DMs are closed (DMs from server members are off, or they blocked the bot).';
+    case 40003:
+      return 'Discord says DMs are being opened too fast. Wait a few minutes and try again.';
+    case 10013:
+      return 'Discord could not find this user (account deleted?).';
+    case 10007:
+      return 'No longer in the server.';
+    case 50013:
+    case 50001:
+      return "The bot doesn't have access to message this user.";
+    default:
+      return `Unexpected error: ${err?.message ?? err}`;
+  }
+}
+
+async function sendReminder(guild, userId) {
+  const member = guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+  if (!member) return { userId, ok: false, detail: 'No longer in the server.' };
+
+  const reminder = reminderPayload(guild, getStats(guild.id, userId).current);
+  if (!reminder) return { userId, ok: false, detail: 'Already has enough invites for every reward.' };
+
+  try {
+    await member.send(reminder.payload);
+    return { userId, ok: true, detail: `${reminder.have}/${reminder.reward.invites} ${reminder.reward.name}` };
+  } catch (err) {
+    return { userId, ok: false, detail: dmFailureReason(err) };
+  }
+}
+
+/** Reads the ticked members from the menu on the message, DMs each, then reports back privately. */
+async function handleReminderSend(interaction) {
+  const menu = interaction.message.components?.[0]?.components?.[0];
+  const ids = (menu?.options ?? []).filter((o) => o.default).map((o) => o.value);
+  if (ids.length === 0) {
+    await safeReply(interaction, { embeds: [embed(null, 'Select at least one member first.')], flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const results = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (i > 0) await sleep(REMINDER_GAP_MS);
+    results.push(await sendReminder(interaction.guild, ids[i]));
+  }
+
+  const sent = results.filter((r) => r.ok).length;
+  const lines = results.map((r) => (r.ok ? `✅ <@${r.userId}> · ${r.detail}` : `❌ <@${r.userId}> · ${r.detail}`));
+  const report = embed(`Reminders delivered: ${sent}/${results.length}`, lines.join('\n')).setColor(
+    sent === results.length ? SUCCESS_COLOR : sent === 0 ? ERROR_COLOR : COLOR,
+  );
+  await interaction.editReply({ embeds: [report], allowedMentions: NO_MENTIONS });
 }
 
 async function handleListButton(interaction) {
-  const [, direction, current] = interaction.customId.split(':');
-  const page = (Number(current) || 0) + (direction === 'next' ? 1 : -1);
-  await interaction.update(listPayload(interaction.guildId, page));
+  const [, action, current] = interaction.customId.split(':');
+  const page = Number(current) || 0;
+
+  if (action === 'send') {
+    await handleReminderSend(interaction);
+    return;
+  }
+  if (action === 'pick') {
+    await interaction.update(await listPayload(interaction.guild, page, new Set(interaction.values)));
+    return;
+  }
+  await interaction.update(await listPayload(interaction.guild, page + (action === 'next' ? 1 : -1)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,7 +2030,7 @@ const commands = [
       .setContexts(InteractionContextType.Guild),
 
     async execute(interaction) {
-      await safeReply(interaction, listPayload(interaction.guildId));
+      await safeReply(interaction, await listPayload(interaction.guild));
     },
   },
 
@@ -2427,7 +2561,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     // /list page buttons (owner only, checked above).
-    if (interaction.inGuild() && interaction.isButton() && interaction.customId.startsWith(LIST_PREFIX)) {
+    if (
+      interaction.inGuild() &&
+      (interaction.isButton() || interaction.isStringSelectMenu()) &&
+      interaction.customId.startsWith(LIST_PREFIX)
+    ) {
       await handleListButton(interaction);
       return;
     }
