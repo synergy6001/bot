@@ -269,6 +269,9 @@ function embed(title, description) {
 const fullDate = (ms) => `<t:${Math.floor(ms / 1000)}:F>`;
 const relativeDate = (ms) => `<t:${Math.floor(ms / 1000)}:R>`;
 
+// Event end: Nov 10th (end of day, UTC). Change the year here if needed.
+const EVENT_END_MS = Date.UTC(2026, 10, 10, 23, 59, 59);
+
 /** Replies (or follows up). Never throws, so a failed reply can't crash the bot. */
 async function safeReply(interaction, payload) {
   const options = { allowedMentions: NO_MENTIONS, ...payload };
@@ -2198,7 +2201,10 @@ const commands = [
           },
         );
 
-      const rewards = embed('The rewards are as follows:', 'Note that this event is ending on Oct 20th.')
+      const rewards = embed(
+        'The rewards are as follows:',
+        `Note that this event is ending on **Nov 10th** (**${relativeDate(EVENT_END_MS)}**).`,
+      )
         .setAuthor({ name: 'Rewards', iconURL: ARROW_ICON })
         .addFields(
           REWARDS.map((r, i) => ({
