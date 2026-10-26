@@ -1,10 +1,10 @@
 // index.js - Discord invite tracker (single file).
-// discord.js v14, better-sqlite3, slash commands only, no message content intent.
+// discord.js v14, sql.js, slash commands only, no message content intent.
 require('dotenv').config();
 
 const fs = require('node:fs');
 const path = require('node:path');
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js'); // pure WebAssembly SQLite: works on any Node version
 const {
   ActionRowBuilder,
   AttachmentBuilder,
@@ -67,12 +67,93 @@ const NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const dbPath = path.resolve(process.env.DB_PATH || './data/bot.db');
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('cache_size = -2000'); // ~2 MB page cache keeps memory low
+// sql.js keeps the database in memory, so this small wrapper gives it the same
+// prepare/get/all/run/transaction API the rest of the code expects and saves the
+// database file to disk after every change.
+let rawDb = null;
+let txDepth = 0;
 
-db.exec(`
+function persist() {
+  if (!rawDb) return;
+  const tmp = `${dbPath}.tmp`;
+  fs.writeFileSync(tmp, Buffer.from(rawDb.export()));
+  fs.renameSync(tmp, dbPath); // atomic swap so a crash can't leave a half-written file
+}
+
+function persistIfIdle() {
+  if (txDepth === 0) persist();
+}
+
+function toBindings(args) {
+  const clean = (v) => (v === undefined ? null : v);
+  if (args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+    const named = {};
+    for (const [k, v] of Object.entries(args[0])) named[`@${k}`] = clean(v);
+    return named;
+  }
+  return args.map(clean);
+}
+
+const db = {
+  exec(sql) {
+    rawDb.exec(sql);
+    persistIfIdle();
+  },
+  prepare(sql) {
+    const withStatement = (args, fn) => {
+      const st = rawDb.prepare(sql);
+      try {
+        st.bind(toBindings(args));
+        return fn(st);
+      } finally {
+        st.free();
+      }
+    };
+    return {
+      get: (...args) => withStatement(args, (st) => (st.step() ? st.getAsObject() : undefined)),
+      all: (...args) =>
+        withStatement(args, (st) => {
+          const rows = [];
+          while (st.step()) rows.push(st.getAsObject());
+          return rows;
+        }),
+      run: (...args) => {
+        withStatement(args, (st) => st.step());
+        const changes = rawDb.getRowsModified();
+        persistIfIdle();
+        return { changes };
+      },
+    };
+  },
+  transaction(fn) {
+    return (...args) => {
+      rawDb.exec('BEGIN');
+      txDepth += 1;
+      try {
+        const result = fn(...args);
+        rawDb.exec('COMMIT');
+        txDepth -= 1;
+        persistIfIdle();
+        return result;
+      } catch (err) {
+        txDepth -= 1;
+        try {
+          rawDb.exec('ROLLBACK');
+        } catch {
+          /* nothing to roll back */
+        }
+        throw err;
+      }
+    };
+  },
+  close() {
+    persist();
+    rawDb.close();
+    rawDb = null;
+  },
+};
+
+const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id       TEXT PRIMARY KEY,
     channel_id     TEXT,
@@ -98,11 +179,26 @@ db.exec(`
     leaves     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (guild_id, inviter_id)
   );
-`);
+`;
 
-// Databases created before claim logging existed don't have the column yet.
-if (!db.prepare('PRAGMA table_info(guild_settings)').all().some((c) => c.name === 'log_channel_id')) {
-  db.exec('ALTER TABLE guild_settings ADD COLUMN log_channel_id TEXT');
+/** Loads (or creates) the database file. Must finish before the bot logs in. */
+async function initDatabase() {
+  const SQL = await initSqlJs();
+  let data = null;
+  if (fs.existsSync(dbPath)) {
+    data = fs.readFileSync(dbPath);
+    // A database last used in WAL mode (the old better-sqlite3 setup) is switched to normal mode.
+    if (data.length > 19 && data[18] === 2) data[18] = 1;
+    if (data.length > 19 && data[19] === 2) data[19] = 1;
+  }
+  rawDb = data ? new SQL.Database(data) : new SQL.Database();
+  rawDb.exec(SCHEMA_SQL);
+
+  // Databases created before claim logging existed don't have the column yet.
+  if (!db.prepare('PRAGMA table_info(guild_settings)').all().some((c) => c.name === 'log_channel_id')) {
+    rawDb.exec('ALTER TABLE guild_settings ADD COLUMN log_channel_id TEXT');
+  }
+  persist();
 }
 
 const q = {
@@ -2636,7 +2732,9 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-client.login(DISCORD_TOKEN).catch((err) => {
-  console.error('Login failed:', err);
-  process.exit(1);
-});
+initDatabase()
+  .then(() => client.login(DISCORD_TOKEN))
+  .catch((err) => {
+    console.error('Startup failed:', err);
+    process.exit(1);
+  });
